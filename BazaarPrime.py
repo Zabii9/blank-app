@@ -26,27 +26,26 @@ VALID_USERS = {
 }
 auth_dict = {u: v["password"] for u, v in VALID_USERS.items()}
 
-# ======================
-# 🛢 DATABASE (Cloud Configuration)
-# ======================
+# # ======================
+# # 🛢 DATABASE (Cloud Configuration)
+# # ======================
+# DB_CONFIG = {
+#     "username": os.getenv("DB_USER", "shahzeb"),
+#     "password": os.getenv("DB_PASSWORD", "shahzeb"),
+#     "host": os.getenv("DB_HOST", "localhost"),
+#     "port": int(os.getenv("DB_PORT", "3306")),
+# }
 DB_CONFIG = {
-    "username": os.getenv("DB_USER", "db42280"),
-    "password": os.getenv("DB_PASSWORD", "admin2233"),
-    "host": os.getenv("DB_HOST", "db42280.public.databaseasp.net"),
-    "port": int(os.getenv("DB_PORT", "3306")),
+    "username": "db42280",
+    "password": "admin2233",
+    "host": "db42280.public.databaseasp.net",
+    "port": "3306",
+    "database": "db42280",
 }
 
-# Map town values to database names
-TOWN_TO_DB = {
-    "all": "db42280",  # Default to main cloud database for 'All Locations'
-    "prime": "db42280",  # Karachi
-    "primelhr": "db42280",  # Lahore (update if separate DB exists)
-}
-
-def get_engine(town="prime"):
-    """Get SQLAlchemy engine for the specified town/database."""
-    db_name = TOWN_TO_DB.get(town, "db42280")
-    connection_string = f"mysql+pymysql://{DB_CONFIG['username']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{db_name}"
+def get_engine():
+    """Get SQLAlchemy engine for the configured database."""
+    connection_string = f"mysql+pymysql://{DB_CONFIG['username']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
     return create_engine(
         connection_string,
         pool_pre_ping=True,
@@ -55,23 +54,23 @@ def get_engine(town="prime"):
         max_overflow=20,
     )
 
-# Default engine (cloud database)
-engine = get_engine("db42280")
+# Default engine
+engine = get_engine()
 
 
 @lru_cache(maxsize=128)
-def _read_sql_cached_json(query, db_name="db42280"):
-    eng = get_engine(db_name)
+def _read_sql_cached_json(query):
+    eng = get_engine()
     return pd.read_sql(query, eng).to_json(orient='split', date_format='iso')
 
 
-def read_sql_cached(query, use_cache=True, db_name="db42280"):
+def read_sql_cached(query, use_cache=True):
     if use_cache:
-        return pd.read_json(StringIO(_read_sql_cached_json(query, db_name)), orient='split')
-    eng = get_engine(db_name)
+        return pd.read_json(StringIO(_read_sql_cached_json(query)), orient='split')
+    eng = get_engine()
     return pd.read_sql(query, eng)
 
-def fetch_booker_less_ctn_data(months_back=3, town="prime"):
+def fetch_booker_less_ctn_data(months_back=3, town="db42280"):
     try:
         months_back = int(months_back)
     except (TypeError, ValueError):
@@ -80,8 +79,7 @@ def fetch_booker_less_ctn_data(months_back=3, town="prime"):
     if months_back not in [1, 2, 3, 4]:
         months_back = 3
 
-    db_name = TOWN_TO_DB.get(town, "db42280")
-    eng = get_engine(db_name)
+    eng = get_engine()
 
     booker_less_ctn_base_cte = f"""
 WITH ContinuousDeliveries AS (
@@ -134,7 +132,7 @@ GROUP BY Booker_Name, brand
 HAVING T_H_C_Del > 0
 ORDER BY Booker_Name, brand, (SUM(HalfCtnDel) / SUM(Total_Deliveries)) DESC
 """
-    booker_less_ctn_df = read_sql_cached(booker_less_ctn_query, db_name=db_name)
+    booker_less_ctn_df = read_sql_cached(booker_less_ctn_query)
 
     booker_less_ctn_detail_query = f"""
 {booker_less_ctn_base_cte}
@@ -151,7 +149,7 @@ WHERE HalfCtnDel > 0
 GROUP BY brand, StoreCode, StoreName, Booker_Name
 ORDER BY Booker_Name, brand, age DESC
 """
-    booker_less_ctn_detail_df = read_sql_cached(booker_less_ctn_detail_query, db_name=db_name)
+    booker_less_ctn_detail_df = read_sql_cached(booker_less_ctn_detail_query)
 
     if booker_less_ctn_df.empty:
         return [{'name': 'Booker Name', 'id': 'Booker_Name'}], [], booker_less_ctn_detail_df.to_dict('records')
@@ -203,12 +201,12 @@ COLORS = {
     "text": "#1e293b",
     "text-light": "#64748b",
     "border": "#e2e8f0",
-    "theme": px.colors.qualitative.Set3,  # Using Plotly's built-in Set3 color scale
+    "theme": px.colors.sequential.Bluyl,  # Using Plotly's built-in Set3 color scale
 }
 
 FONTSIZE = {
-    "title": 28,
-    "subtitle": 18,
+    "title": 20,
+    "subtitle": 10,
     "card_title": 15,
     "label": 12,
     "fontname": "'Segoe UI', 'Helvetica Neue', sans-serif"
@@ -295,10 +293,10 @@ app.layout = html.Div(style={"background": COLORS["bg"], "padding": "28px", "min
             id="town",
             options=[
                 {"label": "All Locations", "value": "all"},
-                {"label": "🏙️ Karachi", "value": "prime"},
-                {"label": "🏢 Lahore", "value": "primelhr"},
+                {"label": "🏙️ Karachi", "value": "D70002202"},
+                {"label": "🏢 Lahore", "value": "D70002246"},
             ],
-            value="prime",
+            value="D70002202",
             clearable=False,
             style={
                 "width": "200px",
@@ -611,9 +609,6 @@ def update_dashboard(start, end, town, selected_dms, selected_channels):
     if not start or not end:
         raise PreventUpdate
     
-    # Map town value to database name
-    db_name = TOWN_TO_DB.get(town, "db42280")
-    
     # Handle 'All' value by adjusting query condition
     if town == 'all':
         town_condition = "IN ('Karachi', 'Lahore')"  # Check for both Karachi and Lahore
@@ -634,6 +629,7 @@ WITH raw AS (
     FROM
         ordervsdelivered o
     LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
+    where o.`Distributor Code` {town_condition}
     GROUP BY
         u.`Channel Type`,
         o.`Delivery Date`,o.`Distributor Code`,`Invoice Number`
@@ -705,13 +701,12 @@ LEFT JOIN
     last_year_period ly ON sp.Channel = ly.Channel
 LEFT JOIN
     last_month lm ON sp.Channel = lm.Channel
-# WHERE sp.town {town_condition}
 
 		
 ORDER BY
     sp.Channel;
     """
-    sales_df = read_sql_cached(query, db_name=db_name)
+    sales_df = read_sql_cached(query)
     brand_sale_query = f"""
 WITH raw AS (
     SELECT
@@ -723,6 +718,7 @@ WITH raw AS (
     FROM
         ordervsdelivered o
     LEFT JOIN sku_master s ON s.sku_code= o.`sku code`
+    where o.`Distributor Code` {town_condition}
     GROUP BY
         s.brand,
         o.`Delivery Date`,o.`Distributor Code`
@@ -788,14 +784,13 @@ LEFT JOIN
     last_year_period ly ON sp.brand = ly.brand
 LEFT JOIN
     last_month lm ON sp.brand = lm.brand
-# WHERE sp.town {town_condition}
 
 		
 ORDER BY
     sp.nmv DESC;
 
     """  
-    brand_df = read_sql_cached(brand_sale_query, db_name=db_name)
+    brand_df = read_sql_cached(brand_sale_query)
     DeliveryMan_Sales_query=f"""
     WITH raw AS (
     SELECT
@@ -808,6 +803,7 @@ ORDER BY
     FROM
         ordervsdelivered o
     LEFT JOIN sku_master s ON s.sku_code= o.`sku code`
+    where o.`Distributor Code` {town_condition}
     GROUP BY
         o.`Deliveryman Name`,
         o.`Delivery Date`,o.`Distributor Code`
@@ -873,14 +869,13 @@ LEFT JOIN
     last_year_period ly ON sp.DeliveryMan = ly.DeliveryMan
 LEFT JOIN
     last_month lm ON sp.DeliveryMan = lm.DeliveryMan
-# where sp.town {town_condition}
 		
 ORDER BY
     sp.DeliveryMan;
     """
-    DeliveryMan_Sales_df = read_sql_cached(DeliveryMan_Sales_query, db_name=db_name)
-    TargetVsAch_Query="""
-    with a as (SELECT 
+    DeliveryMan_Sales_df = read_sql_cached(DeliveryMan_Sales_query)
+    TargetVsAch_Query=f"""
+    SELECT 
 concat(MONTH(`Delivery Date`),"-",YEAR(`Delivery Date`)) as period,
 round(t.Target_In_Value) as Target_Value,
 round(sum(`Delivered Amount`+`Total Discount`)) as NMV,
@@ -894,17 +889,15 @@ Case when o.`Distributor Code`='D70002202' then 'Karachi'
 
 
  from ordervsdelivered o
- LEFT JOIN (SELECT month,year,sum(Target_In_Value) as Target_In_Value,sum(Target_In_Volume) as Target_In_Volume  from targets group by year,month) t on t.month= month(o.`Delivery Date`) and t.year=YEAR(o.`Delivery Date`)
- 
+ LEFT JOIN (SELECT month,year,sum(Target_In_Value) as Target_In_Value,sum(Target_In_Volume) as Target_In_Volume,Distributor_Code  from targets group by year,month,Distributor_Code) t on t.month= month(o.`Delivery Date`) and t.year=YEAR(o.`Delivery Date`) and t.Distributor_Code = o.`Distributor Code`
+where o.`Distributor Code` {town_condition}
  GROUP BY MONTH(`Delivery Date`),YEAR(`Delivery Date`),Town
- order by YEAR(`Delivery Date`),MONTH(`Delivery Date`))
- select * from a
-#  where a.Town {town_condition}
+ order by YEAR(`Delivery Date`),MONTH(`Delivery Date`)
 
 """
-    TargetVsAch_df = read_sql_cached(TargetVsAch_Query, db_name=db_name)
+    TargetVsAch_df = read_sql_cached(TargetVsAch_Query)
     SkuWIseSales_query=f"""
-    with a as (SELECT
+    SELECT
     SUBSTRING_INDEX(s.Master_Sku, ' [', 1) AS SKU,  -- Get everything before the first '['
 	Round(sum( `Delivered Amount` ),0) AS NMV ,
     Case when o.`Distributor Code`='D70002202' then 'Karachi'
@@ -913,15 +906,14 @@ FROM
 	ordervsdelivered o
 	LEFT JOIN sku_master s ON s.Sku_Code = o.`SKU Code` 
 	where `Delivery Date` BETWEEN '{start}' AND '{end}'
+    and o.`Distributor Code` {town_condition}
 GROUP BY
 	s.Master_Sku, Town
 HAVING sum( `Delivered Amount` ) >0
-order by sum(`Delivered Amount`) desc)
-select * from a 
-# where town {town_condition}
+order by sum(`Delivered Amount`) desc
 
     """
-    SKUWise_Sale_df = read_sql_cached(SkuWIseSales_query, db_name=db_name)
+    SKUWise_Sale_df = read_sql_cached(SkuWIseSales_query)
     Channel_DM_Sunbrust_Query=f"""
 SELECT
     u.`Channel Type` as Channel,
@@ -931,14 +923,17 @@ SELECT
         town	
 FROM
 	(SELECT DISTINCT `Deliveryman Name` as DM ,`Store Code`,`SKU Code`,`Delivery Date`,Case when `Distributor Code`='D70002202' then 'Karachi'
-				when `Distributor Code`='D70002246' then 'Lahore' else 'CBL' end Town from ordervsdelivered) o
+				when `Distributor Code`='D70002246' then 'Lahore' else 'CBL' end Town from ordervsdelivered where `Distributor Code` {town_condition}) o
 	LEFT JOIN sku_master s ON s.Sku_Code = o.`SKU Code` 
 	LEFT JOIN universe u on u.`Store Code`=o.`Store Code`
 	where `Delivery Date` BETWEEN '{start}' AND '{end}'
-    # and town {town_condition}
 	GROUP BY u.`Channel Type`,s.Brand,o.dm,o.town
     """
-    Channel_DM_Sunbrust_df = read_sql_cached(Channel_DM_Sunbrust_Query, db_name=db_name)
+    Channel_DM_Sunbrust_df = read_sql_cached(Channel_DM_Sunbrust_Query)
+    
+    # Remove rows with None/NULL values in Brand or DM to prevent Plotly sunburst errors
+    Channel_DM_Sunbrust_df = Channel_DM_Sunbrust_df.dropna(subset=['Brand', 'DM'])
+    
     dm_options = [{"label": d, "value": d} for d in sorted(Channel_DM_Sunbrust_df["DM"].dropna().unique())]
     if selected_dms:
         if isinstance(selected_dms, str):
@@ -946,7 +941,7 @@ FROM
         Channel_DM_Sunbrust_df = Channel_DM_Sunbrust_df[Channel_DM_Sunbrust_df["DM"].isin(selected_dms)]
     TGTVsAch_Booker_query=f"""
      
-with a as (SELECT concat(MONTH(`Delivery Date`),"-",YEAR(`Delivery Date`)) as period,
+SELECT concat(MONTH(`Delivery Date`),"-",YEAR(`Delivery Date`)) as period,
 o.`Order Booker Name` as Booker,
 round(t.Target_In_Value) as Target_Value,
 round(sum(`Delivered Amount`+`Total Discount`)) as NMV,
@@ -961,19 +956,17 @@ Case when o.`Distributor Code`='D70002202' then 'Karachi'
 
  from ordervsdelivered o
  LEFT JOIN (SELECT month,year,sum(Target_In_Value) as Target_In_Value,sum(Target_In_Volume) as Target_In_Volume,order_booker_code  from targets group by year,month,order_booker_code) t on t.month= month(o.`Delivery Date`) and t.year=YEAR(o.`Delivery Date`) and t.order_booker_code=o.`Order Booker Code`
- 
+ where o.`Distributor Code` {town_condition}
  
  
  GROUP BY MONTH(`Delivery Date`),YEAR(`Delivery Date`),o.`Order Booker Name`,town 
- order by YEAR(`Delivery Date`),MONTH(`Delivery Date`),o.`Order Booker Name`)
- select * from a 
-# where town {town_condition}
+ order by YEAR(`Delivery Date`),MONTH(`Delivery Date`),o.`Order Booker Name`
 
     """
-    TGTVsAch_Booker_df = read_sql_cached(TGTVsAch_Booker_query, db_name=db_name)
+    TGTVsAch_Booker_df = read_sql_cached(TGTVsAch_Booker_query)
 
     Channel_NMV_YTD_query=f"""
-with a as (SELECT
+SELECT
     CONCAT(YEAR(`Delivery Date`), '-', LPAD(MONTH(`Delivery Date`), 2, '0')) AS period,
     u.`Channel Type` AS Channel,
     ROUND(SUM(`Delivered Amount` + `Total Discount`)) AS NMV,
@@ -984,16 +977,14 @@ FROM
     ordervsdelivered o
 INNER JOIN 
     universe u ON u.`Store Code` = o.`Store Code`  -- Use INNER JOIN if no missing records
-
+WHERE o.`Distributor Code` {town_condition}
 GROUP BY 
     period, u.`Channel Type`,town  -- Group by calculated period
 ORDER BY 
-    period, u.`Channel Type`)  -- Sorting by period and Channel Type
-    select * from a 
-    # where town {town_condition}
+    period, u.`Channel Type`
     
 """
-    Channel_NMV_YTD_df = read_sql_cached(Channel_NMV_YTD_query, db_name=db_name)
+    Channel_NMV_YTD_df = read_sql_cached(Channel_NMV_YTD_query)
 
     Channel_Treemap_query=f"""
 SELECT
@@ -1007,12 +998,13 @@ INNER JOIN
 WHERE 
     `Delivery Date` >= DATE_SUB(CURDATE(), INTERVAL 7 MONTH)  -- Get data from 7 months ago
     AND (YEAR(`Delivery Date`) < YEAR(CURDATE()) OR (YEAR(`Delivery Date`) = YEAR(CURDATE()) AND MONTH(`Delivery Date`) < MONTH(CURDATE())))  -- Exclude current month
-GROUP BY 
+    AND o.`Distributor Code` {town_condition}
+    GROUP BY 
     period, u.`Channel Type`
 ORDER BY 
     period, u.`Channel Type`
 """
-    Channel_Treemap_df = read_sql_cached(Channel_Treemap_query, db_name=db_name)
+    Channel_Treemap_df = read_sql_cached(Channel_Treemap_query)
     
     if brand_df.empty  or sales_df.empty or Channel_NMV_YTD_df.empty or TGTVsAch_Booker_df.empty or DeliveryMan_Sales_df.empty or TargetVsAch_df.empty or SKUWise_Sale_df.empty or Channel_DM_Sunbrust_df.empty or Channel_Treemap_df.empty:
         raise PreventUpdate
@@ -1464,6 +1456,7 @@ ORDER BY
         textposition="inside",  # Position text inside the bars
         # hovertemplate='%{y:.0f}M',  # Format the hovertext
     ))
+
         # Adding Ltr Growth % trace with dynamic color based on value
     fig_TgtvsAch.add_trace(go.Bar(
             x=TgtVsAch_dt_df["period"], 
@@ -1717,7 +1710,7 @@ ORDER BY
 )
 def store_selected_town(town):
     """Store the selected town/database in dcc.Store for use in other callbacks."""
-    return TOWN_TO_DB.get(town, "db42280")
+    return town
 
 
 @app.callback(
@@ -1728,7 +1721,7 @@ def store_selected_town(town):
     State("selected-town-store", "data"),
 )
 def update_booker_monthly_report(booker_month_filter, selected_town):
-    selected_town = selected_town or "prime"
+    selected_town = selected_town or "all"
     return fetch_booker_less_ctn_data(booker_month_filter, selected_town)
 
 
@@ -1780,5 +1773,4 @@ def update_booker_subreport(active_cell, table_data, detail_data):
 if __name__ == "__main__":
     # For local testing use debug=True
     # For cloud deployment, debug should be False
-    app.run(debug=False)
-	# app.run_server(host='0.0.0.0', port=80, debug=False)
+    app.run(debug=True)
