@@ -826,89 +826,60 @@ WHERE Distributor_Code ='{town_code}'
         ORDER BY period DESC
         """
         return read_sql_cached(query, "db42280")
-    
+
+@st.cache_data(ttl=3600)
+def AOV_MOPU_data(town_code, months_back): 
+    """Fetch data for Average Order Value (AOV) and MOPU calculations."""
+    query = f"""
+    WITH last_6_months AS (
+    SELECT *,`Delivered Units`/UOM as Del_Ctn
+    FROM ordervsdelivered
+		left join sku_master m on m.Sku_Code= `SKU Code`
+    WHERE `Order Date` >= DATE_SUB(CURDATE(), INTERVAL {months_back} MONTH)
+		and `Distributor Code`='{town_code}'
+)
+SELECT 
+    DATE_FORMAT(`Order Date`, '%%Y-%%m') AS `Month`,
+    COUNT(DISTINCT `Order Number`) AS `Total_Orders`,                     -- total orders by booker
+    SUM(`Delivered Units`)/COUNT(DISTINCT `shopcode`) AS `Drop_Size`,                                 -- total units delivered
+    AVG(`SKU Count Per Order`) AS `SKU_Per_Bill`,                           -- average SKU per order
+    COUNT(DISTINCT `Order Number`) / COUNT(DISTINCT `shopcode`) AS `MOPU`                            -- monthly orders per user (simplified)
+FROM (
+    SELECT 
+        `Order Number`,
+        `Order Date`,
+        COUNT(DISTINCT `SKU Code`) AS `SKU Count Per Order`,
+        SUM(Del_Ctn) AS `Delivered Units`,
+				`store code` as shopcode
+    FROM last_6_months
+		
+    GROUP BY `Order Number`, `Order Date`,`store code`
+) AS sub
+GROUP BY `Month`
+ORDER BY `Month` DESC
+"""
+    return read_sql_cached(query, "db42280")
+
+@st.cache_data(ttl=3600)
+def ON_Wise_Visit_freq_data(town_code):
+    """Fetch data for visit frequency analysis."""
+    query = f"""
+    SELECT 
+    DATE_FORMAT(`Visit Date`, '%Y-%m') AS VisitMonth,
+    TRIM(SUBSTRING_INDEX(`App User`, '[', 1)) AS OB_Name,
+    COUNT(*) AS Total_Visits,
+    SUM(CASE WHEN `Visit Complete` = 'Yes' THEN 1 ELSE 0 END) AS Completed_Visits,
+    SUM(CASE WHEN `Non Productive` = 'Yes' THEN 1 ELSE 0 END) AS Non_Productive_Visits
+FROM visits
+WHERE `Visit Date` >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
+and TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(`Distributor`, '[', -1),']',1)) = '{town_code}'
+GROUP BY VisitMonth, OB_Name
+ORDER BY VisitMonth DESC, OB_Name;    
+"""
 
 # ======================
 # 📈 VISUALIZATION FUNCTIONS
 # ======================
-
-def create_treemap(df, selected_channels=None):
-    """Create channel treemap with period hierarchy"""
-    if df.empty:
-        fig = go.Figure()
-        fig.add_annotation(
-            text="No data available for the selected period",
-            xref="paper", yref="paper",
-            x=0.5, y=0.5, showarrow=False,
-            font=dict(size=16, color="gray")
-        )
-        return fig
-    
-    if selected_channels:
-        df = df[df['channel'].isin(selected_channels)]
-        if df.empty:
-            fig = go.Figure()
-            fig.add_annotation(
-                text="No data for selected channels",
-                xref="paper", yref="paper",
-                x=0.5, y=0.5, showarrow=False,
-                font=dict(size=16, color="gray")
-            )
-            return fig
-    
-    df['nmv_millions'] = df['nmv'] / 1_000_000
-    period_totals = df.groupby('period')['nmv_millions'].sum().to_dict()
-    
-    # Build hierarchical structure
-    labels = ["Total"]
-    parents = [""]
-    values = [df['nmv_millions'].sum()]
-    ids = ["total"]
-    text_labels = ["Total Sales"]
-    
-    period_order = sorted(df['period'].unique(), key=lambda x: datetime.strptime(x, '%Y-%m'))
-    
-    for period in period_order:
-        labels.append(period)
-        parents.append("Total")
-        period_total = period_totals.get(period, 0)
-        values.append(period_total)
-        ids.append(f"period_{period}")
-        text_labels.append(f"{period} | {period_total:.2f}M")
-    
-    for period in period_order:
-        period_data = df[df['period'] == period]
-        for _, row in period_data.iterrows():
-            labels.append(row['channel'])
-            parents.append(period)
-            values.append(row['nmv_millions'])
-            ids.append(f"{period}_{row['channel']}")
-            text_labels.append(f"{row['channel']}<br>{row['nmv_millions']:.2f}M")
-    
-    fig = go.Figure(go.Treemap(
-        labels=labels,
-        parents=parents,
-        values=values,
-        ids=ids,
-        text=text_labels,
-        textposition="middle center",
-        textfont=dict(size=14, color='white'),
-        marker=dict(
-            colorscale='viridis',
-            line=dict(width=2, color='white')
-        ),
-        hovertemplate='<b>%{label}</b><br>NMV: %{value:.2f}M<extra></extra>'
-    ))
-    
-    fig.update_layout(
-        title="🗺️ 6-Month Channel Performance (Period-wise Breakdown)",
-        height=600,
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='white')
-    )
-    
-    return fig
 
 def create_Channel_dm_sunburst(df, selected_dms=None, selected_channels=None):
     """Create Channel-Brand-DM sunburst chart with optional DM filter."""
@@ -948,7 +919,13 @@ def create_Channel_dm_sunburst(df, selected_dms=None, selected_channels=None):
 
     df_plot = df.copy()
     df_plot['StoreCount'] = pd.to_numeric(df_plot['StoreCount'], errors='coerce').fillna(0)
-    
+    my_palette = [
+    "#FFC145",  # blue
+    "#5B5F97",  # red
+    "#B8B8D1",  # green
+    "#FFFFFB",  # orange
+    "#FF6B6C"   # purple
+]
     fig = px.sunburst(
         df_plot,
         path=['Channel', 'Brand', 'DM'],
@@ -959,7 +936,8 @@ def create_Channel_dm_sunburst(df, selected_dms=None, selected_channels=None):
     fig.update_traces(
         textinfo="label+percent entry",
         textfont=dict(size=12, color='white'),
-        hovertemplate='<b>%{label}</b><br>Stores: %{value:.0f}<extra></extra>'
+        hovertemplate='<b>%{label}</b><br>Stores: %{value:.0f}<extra></extra>',
+        marker=dict(colorscale=my_palette)
     )
     
     fig.update_layout(
@@ -969,22 +947,6 @@ def create_Channel_dm_sunburst(df, selected_dms=None, selected_channels=None):
         font=dict(color='white')
     )
     return fig
-
-
-def fetch_bazaarprime_dashboard(start_date, end_date, town, selected_dms=None, selected_channels=None):
-    """Reuse BazaarPrime.py dashboard logic and return all figures/data for Streamlit rendering."""
-    from BazaarPrime import update_dashboard
-
-    selected_dms = selected_dms or []
-    selected_channels = selected_channels or []
-
-    return update_dashboard(
-        str(start_date),
-        str(end_date),
-        town,
-        selected_dms,
-        selected_channels,
-    )
 
 def create_Channel_performance_chart(df, metric_type='Value'):
     """
@@ -1031,9 +993,9 @@ def create_Channel_performance_chart(df, metric_type='Value'):
     
     # Format values for display
     if metric_type == 'Value':
-        current_vals = df_processed[current_col].round(2)
-        last_year_vals = df_processed[last_year_col].round(2)
-        last_month_vals = df_processed[last_month_col].round(2)
+        current_vals = df_processed[current_col].round(1)
+        last_year_vals = df_processed[last_year_col].round(1)
+        last_month_vals = df_processed[last_month_col].round(1)
     else:
         current_vals = df_processed[current_col].round(0)
         last_year_vals = df_processed[last_year_col].round(0)
@@ -1060,7 +1022,7 @@ def create_Channel_performance_chart(df, metric_type='Value'):
             texttemplate='%{text}' + unit_label,
             hovertext=hover_current,
             hoverinfo='text',
-            marker=dict(color='#1f77b4')
+            marker=dict(color='#5B5F97')
         ),
         go.Bar(
             x=df_processed['Channel'],
@@ -1071,7 +1033,7 @@ def create_Channel_performance_chart(df, metric_type='Value'):
             texttemplate='%{text}' + unit_label,
             hovertext=hover_last_year,
             hoverinfo='text',
-            marker=dict(color='#ff7f0e')
+            marker=dict(color='#B8B8D1')
         ),
         go.Bar(
             x=df_processed['Channel'],
@@ -1082,23 +1044,23 @@ def create_Channel_performance_chart(df, metric_type='Value'):
             texttemplate='%{text}' + unit_label,
             hovertext=hover_last_month,
             hoverinfo='text',
-            marker=dict(color='#2ca02c')
+            marker=dict(color='#FFC145')
         )
     ])
     
     y_axis_title = 'Sales (in Millions)' if metric_type == 'Value' else 'Litres'
     
     fig.update_layout(
-        # title=f"📊 Channel Performance Comparison - {metric_type}",
+        title=f"📊 Channel Performance Comparison - {metric_type}",
         yaxis=dict(title=y_axis_title),
         xaxis=dict(title='Channel'),
-        height=600,
+        # height=600,
         barmode='group',
         hovermode='x unified',
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
         font=dict(size=12, weight='bold'),
-        legend=dict(title='Period', orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
     )
 
     return apply_theme_aware_bar_labels(fig)
@@ -1157,8 +1119,8 @@ def create_channel_wise_growth_chart(df, metric_type='Value'):
         last_month_vals,
     ])
 
-    ly_colors = ['#39A039' if value >= 0 else '#FF6B6B' for value in df_processed[growth_ly_col]]
-    lm_colors = ['#2E8B57' if value >= 0 else '#E74C3C' for value in df_processed[growth_lm_col]]
+    ly_colors = ['#B8B8D1' if value >= 0 else '#FF6B6C' for value in df_processed[growth_ly_col]]
+    lm_colors = ['#FFC145' if value >= 0 else '#FF6B6C' for value in df_processed[growth_lm_col]]
 
     fig = go.Figure()
     fig.add_trace(
@@ -1204,12 +1166,12 @@ def create_channel_wise_growth_chart(df, metric_type='Value'):
         title=f"📈 Channel-wise Growth Percentage - {metric_type}",
         yaxis=dict(title='Growth %'),
         xaxis=dict(title='Channel'),
-        height=500,
+        # height=500,
         barmode='group',
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
         font=dict(size=12, weight='bold'),
-        legend=dict(title='Growth Comparison', orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
     )
 
     return apply_theme_aware_bar_labels(fig)
@@ -1268,8 +1230,8 @@ def create_brand_wise_growth_chart(df, metric_type='Value'):
         last_month_vals,
     ])
 
-    ly_colors = ['#39A039' if value >= 0 else '#FF6B6B' for value in df_processed[growth_ly_col]]
-    lm_colors = ['#2E8B57' if value >= 0 else '#E74C3C' for value in df_processed[growth_lm_col]]
+    ly_colors = ['#B8B8D1' if value >= 0 else '#FF6B6C' for value in df_processed[growth_ly_col]]
+    lm_colors = ['#FFC145' if value >= 0 else '#FF6B6C' for value in df_processed[growth_lm_col]]
     fig = go.Figure()
     fig.add_trace(
         go.Bar(
@@ -1313,12 +1275,12 @@ def create_brand_wise_growth_chart(df, metric_type='Value'):
         title=f"📈 Brand-wise Growth Percentage - {metric_type}",
         yaxis=dict(title='Growth %'),
         xaxis=dict(title='Brand'),
-        height=600,
+        # height=600,
         barmode='group',
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
         font=dict(size=12, weight='bold'),
-        legend=dict(title='Growth Comparison', orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
+        legend=dict( orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
     )
     return apply_theme_aware_bar_labels(fig)
 
@@ -1376,8 +1338,8 @@ def create_dm_wise_growth_chart(df, metric_type='Value'):
         last_month_vals,
     ])
 
-    ly_colors = ['#39A039' if value >= 0 else '#FF6B6B' for value in df_processed[growth_ly_col]]
-    lm_colors = ['#2E8B57' if value >= 0 else '#E74C3C' for value in df_processed[growth_lm_col]]
+    ly_colors = ['#B8B8D1' if value >= 0 else '#FF6B6C' for value in df_processed[growth_ly_col]]
+    lm_colors = ['#FFC145' if value >= 0 else '#FF6B6C' for value in df_processed[growth_lm_col]]
     fig = go.Figure()
     fig.add_trace(
         go.Bar(
@@ -1421,12 +1383,12 @@ def create_dm_wise_growth_chart(df, metric_type='Value'):
         title=f"📈 Deliveryman-wise Growth Percentage - {metric_type}",
         yaxis=dict(title='Growth %'),
         xaxis=dict(title='Deliveryman'),
-        height=600,
+        # height=600,
         barmode='group',
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
         font=dict(size=12, weight='bold'),
-        legend=dict(title='Growth Comparison', orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
+        legend=dict( orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
     )
     return apply_theme_aware_bar_labels(fig)
 
@@ -1478,7 +1440,7 @@ def create_target_achievement_chart(df, metric_type='Value'):
             x=df['period'],
             y=df['Target'],
             name='Target',
-            marker=dict(color='#1f77b4'),
+            marker=dict(color='#5B5F97'),
             text =(df['Target'] / divisor).round(2).astype(str) + unit_label,
             textposition='inside',
             hovertemplate=f'<b>%{{x|%b %Y}}</b><br>Target: %{{y/divisor:.2f}}{unit_label}<extra></extra>'
@@ -1489,7 +1451,7 @@ def create_target_achievement_chart(df, metric_type='Value'):
             x=df['period'],
             y=df['Achievement'],
             name='Achievement',
-            marker=dict(color='#ff7f0e'),
+            marker=dict(color='#FFC145'),
             text = (
                     (df['Achievement'] / divisor).round(2).astype(str) + unit_label
                         + " | "
@@ -1503,7 +1465,7 @@ def create_target_achievement_chart(df, metric_type='Value'):
         title=f"🎯 Target vs Achievement Comparison - {metric_label}",
         yaxis=dict(title=y_axis_title),
         xaxis=dict(title='Period'),
-        height=600,
+        # height=600,
         barmode='group',
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
@@ -1559,7 +1521,7 @@ def brand_wise_productivity_chart(df,selected_dms=None, selected_channels=None):
         x='StoreCount',
         title="📊 Brand-wise Productivity",
         labels={brand_col: 'Brand', 'StoreCount': 'Productivity (Units per Store)'},
-        color_discrete_sequence=['#1f77b4'] * len(brand_prod),
+        color_discrete_sequence=['#5B5F97'] * len(brand_prod),
         orientation='h',
     )
     
@@ -1699,8 +1661,8 @@ def create_booker_period_heatmap(df, metric_type='Value'):
         height=600,
         annotations=annotations,
         paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='white')
+        plot_bgcolor='rgba(0,0,0,0)'
+        
     )
 
     return fig
@@ -1802,8 +1764,8 @@ def create_channel_heatmap_YTD(df, metric_type='Value'):
         # height=700,
         annotations=annotations,
         paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='white')
+        plot_bgcolor='rgba(0,0,0,0)'
+        # font=dict(color='white')
     )
     return fig
 
@@ -1852,13 +1814,30 @@ def render_achievement_band_legend():
 
 def get_theme_text_color():
     """Return readable text color for current Streamlit theme."""
-    base_theme = st.get_option("theme.base")
-    return "#111827" if base_theme == "light" else "#F8FAFC"
+    theme_text_color = st.get_option("theme.textColor")
+    if theme_text_color:
+        return theme_text_color
+
+    theme_bg = st.get_option("theme.backgroundColor")
+    if isinstance(theme_bg, str) and theme_bg.startswith("#") and len(theme_bg) == 7:
+        red = int(theme_bg[1:3], 16)
+        green = int(theme_bg[3:5], 16)
+        blue = int(theme_bg[5:7], 16)
+        luminance = (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255
+        return "#111827" if luminance > 0.5 else "#F8FAFC"
+
+    base_theme = (st.get_option("theme.base") or "").strip().lower()
+    if base_theme == "light":
+        return "#111827"
+    if base_theme == "dark":
+        return "#F8FAFC"
+    return None
 
 def apply_theme_aware_bar_labels(fig):
     """Apply theme-aware text color on all bar-trace data labels."""
     label_color = get_theme_text_color()
-    fig.update_traces(selector=dict(type="bar"), textfont=dict(color=label_color))
+    if label_color:
+        fig.update_traces(selector=dict(type="bar"), textfont=dict(color=label_color))
     return fig
 
 def create_tgtach_brand_maptree(df, achievement_below=None, selected_brands=None):
@@ -2221,8 +2200,109 @@ def create_tgtach_brand_booker_maptree(df, achievement_below=None, selected_bran
     )
     return fig
     
+st.markdown("""
+<style>
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #FFC145, #E9C377);
+}
+</style>
+""", unsafe_allow_html=True)
 
+def AOV_MOPU_bar_chart(df):
+    """Create AOV and MOPU bar chart with dynamic labels and hover info."""
+    if df is None or df.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No data available",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16, color="gray")
+        )
+        return fig
 
+    required_cols = {'Month', 'Total_Orders', 'Drop_Size','SKU_Per_Bill','MOPU'}
+    if not required_cols.issubset(df.columns):
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Required columns for AOV/MOPU chart not found",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16, color="gray")
+        )
+        return fig
+
+    df_plot = df.copy()
+    df_plot['Total_Orders'] = pd.to_numeric(df_plot['Total_Orders'], errors='coerce')
+    df_plot['Drop_Size'] = pd.to_numeric(df_plot['Drop_Size'], errors='coerce')
+    df_plot['SKU_Per_Bill'] = pd.to_numeric(df_plot['SKU_Per_Bill'], errors='coerce')
+    df_plot['MOPU'] = pd.to_numeric(df_plot['MOPU'], errors='coerce')
+
+    df_plot['Month'] = pd.to_datetime(df_plot['Month'], format='%Y-%m', errors='coerce')
+    if df_plot['Month'].isna().all():
+        df_plot['Month'] = pd.to_datetime(df_plot['Month'], errors='coerce')
+
+    df_plot = df_plot.dropna(subset=['Month', 'Total_Orders', 'Drop_Size','SKU_Per_Bill','MOPU'])
+    if df_plot.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No valid AOV/MOPU data available",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16, color="gray")
+        )
+        return fig
+
+    df_plot = df_plot.sort_values('Month')
+    df_plot['Month_Label'] = df_plot['Month'].dt.strftime('%b-%y')
+
+    fig = go.Figure(data=[
+        go.Bar(
+            name='Drop Size',
+            x=df_plot['Month_Label'],
+            y=df_plot['Drop_Size'],
+            text=df_plot['Drop_Size'].apply(lambda x: f"{x:,.0f}"),
+            textposition='auto',
+            hovertemplate='<b>Drop Size</b><br>Value: %{y:,.0f}<extra></extra>',
+            marker_color='#B8B8D1',
+            yaxis='y'
+        ),
+        go.Scatter(
+            name='SKU Per Bill',
+            x=df_plot['Month_Label'],
+            y=df_plot['SKU_Per_Bill'],
+            mode='lines+markers+text',
+            text=df_plot['SKU_Per_Bill'].apply(lambda x: f"{x:.2f}"),
+            textposition='top center',
+            hovertemplate='<b>SKU Per Bill</b><br>Value: %{y:.2f}<extra></extra>',
+            line=dict(color='#FFC145', width=2),
+            marker=dict(size=8),
+            yaxis='y2'
+        ),
+        go.Scatter(
+            name='MOPU',
+            x=df_plot['Month_Label'],
+            y=df_plot['MOPU'],
+            mode='lines+markers+text',
+            text=df_plot['MOPU'].apply(lambda x: f"{x:.2f}"),
+            textposition='top center',
+            hovertemplate='<b>MOPU</b><br>Value: %{y:.2f}<extra></extra>',
+            line=dict(color='#FF6B6C', width=2),
+            marker=dict(size=8),
+            yaxis='y2'
+        )
+    ])
+    fig.update_layout(
+        title='📊 Total Orders, Drop Size, SKU Per Bill & MOPU by Period',
+        xaxis_title='Period',
+        yaxis=dict(title='Total Orders', side='left', showgrid=True),
+        yaxis2=dict(title='Drop Size / SKU Per Bill / MOPU', side='right', overlaying='y', showgrid=False),
+        hovermode='x unified',
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color=get_theme_text_color() or '#111827'),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
+    )
+    return fig
 
 
 # ======================
@@ -2235,6 +2315,7 @@ def main():
 
     # Sidebar
     st.sidebar.title("⚙️ Settings")
+    st.sidebar.background_color = "#C58C1B"
 
     # Display username if available
     if st.session_state.get("username"):
@@ -2253,7 +2334,7 @@ def main():
     period_option = st.sidebar.selectbox(
         "Select Period",
         options=["Last 7 Days", "Last 30 Days", "This Month", "Last Month", "Last 3 Months", "YTD", "Custom"],
-        index=1,
+        index=2,
     )
 
     today = datetime.today().date()
@@ -2367,13 +2448,13 @@ def main():
 
             with col1:
                     st.markdown(f"""
-                    <div style='text-align: center ;box-shadow: 0 4px 12px rgba(0,0,0,0.15);border-radius: 10px;padding: 15px;background-color: #f0f0f0;'>
+                    <div style='text-align: center ;box-shadow: 0 4px 12px rgba(0,0,0,0.15);border-radius: 10px;padding: 15px;background: linear-gradient(180deg, #FFFFFB, #EBEBE5);'>
                     <h6 style='color: black; margin-bottom: 5px;'>💰 Total Revenue</h6>
                     <h3 style='color: black; margin: 1px 0;'>Rs {current_revenue / 1_000_000:.2f}M</h3>
-                    <p style='color: {"#39A039" if revenue_growth_ly >= 0 else '#FF6B6B'}; font-size: 14px;font-weight: bold; margin: 3px 0;'>
+                    <p style='color: {"#39A039" if revenue_growth_ly >= 0 else '#FF6B6C'}; font-size: 14px;font-weight: bold; margin: 3px 0;'>
                         {'▲' if revenue_growth_ly >= 0 else '▼'} {abs(revenue_growth_ly):.2f}% vs Last Year
                     </p>
-                        <p style='color: {"#39A039" if revenue_growth_lm >= 0 else '#FF6B6B'}; font-size: 12px;font-weight: bold; margin: 3px 0;'>
+                        <p style='color: {"#39A039" if revenue_growth_lm >= 0 else '#FF6B6C'}; font-size: 12px;font-weight: bold; margin: 3px 0;'>
                         {'▲' if revenue_growth_lm >= 0 else '▼'} {abs(revenue_growth_lm):.2f}% vs Last Month
                     </p>
                 </div>
@@ -2381,7 +2462,7 @@ def main():
 
             with col2:
                 st.markdown(f"""
-            <div style='text-align: center;box-shadow: 0 4px 12px rgba(0,0,0,0.15);border-radius: 10px;padding: 15px;background-color: #f0f0f0;'>
+            <div style='text-align: center;box-shadow: 0 4px 12px rgba(0,0,0,0.15);border-radius: 10px;padding: 15px;background: linear-gradient(180deg, #FFFFFB, #EBEBE5);'>
                 <h6 style='color: black; margin-bottom: 5px;'>🛢 Total Litres</h6>
                 <h3 style='color: black; margin: 1px 0;'>{current_ltr:,.0f} Ltr</h3>
                 <p style='color: {"#39A039" if ltr_growth_ly >= 0 else '#FF6B6B'}; font-size: 14px;font-weight: bold; margin: 3px 0;'>
@@ -2395,7 +2476,7 @@ def main():
 
             with col3:
                 st.markdown(f"""
-            <div style='text-align: center;box-shadow: 0 4px 12px rgba(0,0,0,0.15);border-radius: 10px;padding: 15px;background-color: #f0f0f0;'>
+            <div style='text-align: center;box-shadow: 0 4px 12px rgba(0,0,0,0.15);border-radius: 10px;padding: 15px;background: linear-gradient(180deg, #FFFFFB, #EBEBE5);'>
                 <h6 style='color: black; margin-bottom: 5px;'>🧾 Total Orders</h6>
                 <h3 style='color: black; margin: 1px 0;'>{int(current_orders):,}</h3>
                 <p style='color: {"#39A039" if orders_growth_ly >= 0 else '#FF6B6B'}; font-size: 14px;font-weight: bold; margin: 3px 0;'>
@@ -2409,7 +2490,7 @@ def main():
 
             with col4:
                 st.markdown(f"""
-            <div style='text-align: center;box-shadow: 0 4px 12px rgba(0,0,0,0.15);border-radius: 10px;padding: 15px;background-color: #f0f0f0;'>
+            <div style='text-align: center;box-shadow: 0 4px 12px rgba(0,0,0,0.15);border-radius: 10px;padding: 15px;background: linear-gradient(180deg, #FFFFFB, #EBEBE5);'>
                 <h6 style='color: black; margin-bottom: 5px;'>📦 Avg Order Value</h6>
                 <h3 style='color: black; margin: 1px 0;'>Rs {aov_current / 1000:.1f}K</h3>
                 <p style='color: {"#39A039" if aov_growth_ly >= 0 else '#FF6B6B'}; font-size: 14px;font-weight: bold; margin: 3px 0;'>
@@ -2514,146 +2595,40 @@ def main():
                             """,
                                 unsafe_allow_html=True,
                             )
-
-        st.markdown("---")
-
-        # BazaarPrime Charts (all dashboard charts from BazaarPrime.py)
-        # if "selected_dms" not in st.session_state:
-        #     st.session_state.selected_dms = []
-        # if "selected_channels" not in st.session_state:
-        #     st.session_state.selected_channels = []
-
-        # try:
-        #     (
-        #         _kpis,
-        #         fig_daily,
-        #         fig_type,
-        #         fig_sales_growth,
-        #         fig_brand_comparison,
-        #         fig_brand_growth_bar,
-        #         brand_datatable,
-        #         fig_dm_comparison,
-        #         fig_tgt_vs_ach_ytd,
-        #         fig_sku_heatmap,
-        #         fig_channel_sunburst,
-        #         dm_options,
-        #         fig_brand_productivity,
-        #         fig_tgt_vs_ach_booker,
-        #         fig_channel_nmv_ytd,
-        #         channel_options,
-        #         fig_channel_treemap,
-        #     ) = fetch_bazaarprime_dashboard(
-        #         start_date,
-        #         end_date,
-        #         town_code,
-        #         st.session_state.selected_dms,
-        #         st.session_state.selected_channels,
-        #     )
-        # except Exception as exc:
-        #     st.error(f"Failed to load BazaarPrime charts: {exc}")
-        #     st.stop()
-
-        # dm_values = [item["value"] for item in (dm_options or [])]
-        # channel_values = [item["value"] for item in (channel_options or [])]
-
-        # st.subheader("📊 Sales Overview")
-        # c1, c2 = st.columns([2, 1])
-        # with c1:
-        #     st.plotly_chart(fig_daily, use_container_width=True)
-        # with c2:
-        #     st.plotly_chart(fig_type, use_container_width=True)
-        # st.plotly_chart(fig_sales_growth, use_container_width=True)
-
-        # st.markdown("---")
-        # st.subheader("🏢 Brand Performance")
-        # st.plotly_chart(fig_brand_comparison, use_container_width=True)
-        # st.plotly_chart(fig_brand_growth_bar, use_container_width=True)
-        # st.dataframe(pd.DataFrame(brand_datatable), use_container_width=True, height=420)
-
-        # st.markdown("---")
-        # st.subheader("🚚 Delivery & Operations Analytics")
-        # st.plotly_chart(fig_dm_comparison, use_container_width=True)
-        # st.plotly_chart(fig_tgt_vs_ach_ytd, use_container_width=True)
-        # st.plotly_chart(fig_sku_heatmap, use_container_width=True)
-
-        # st.markdown("---")
-        # st.subheader("📊 Channel & Productivity Analysis")
-        # col1, col2, col3 = st.columns([1,2,1])
-        # with col2:
-        #     selected_dms = st.multiselect(
-        #     "Filter Deliverymen",
-        #     options=dm_values,
-        #     default=[dm for dm in st.session_state.selected_dms if dm in dm_values],
-        #     )
-
-        # if selected_dms != st.session_state.selected_dms :
-        #     st.session_state.selected_dms = selected_dms
-        #     st.rerun()
-        
-        # c3, c4 = st.columns([1.5, 1])
-        # with c3:
-        #     st.plotly_chart(fig_channel_sunburst, use_container_width=True)
-        # with c4:
-        #     st.plotly_chart(fig_brand_productivity, use_container_width=True)
-
-        # st.markdown("---")
-        # st.subheader("🎯 Target vs Achievement")
-        # c5, c6 = st.columns(2)
-        # with c5:
-        #     st.plotly_chart(fig_tgt_vs_ach_booker, use_container_width=True)
-        # with c6:
-        #     st.plotly_chart(fig_channel_nmv_ytd, use_container_width=True)
-
-        # st.markdown("---")
-        # # st.subheader("🌳 Channel Performance - 6 Month Breakdown")
-        # col1, col2, col3 = st.columns([1,2,1])
-        # with col2:
-        #     selected_channels = st.multiselect(
-        #     "Filter Channels",
-        #     options=channel_values,
-        #     default=[ch for ch in st.session_state.selected_channels if ch in channel_values],
-        # )
-        # if selected_channels != st.session_state.selected_channels:
-        #     st.session_state.selected_channels = selected_channels
-        #     st.rerun()
-        # st.plotly_chart(fig_channel_treemap, use_container_width=True)
-
-        # st.markdown("---")
-
         # Booker Analysis Section
-        
         #channel wise sales performance chart
         st.markdown("---")
         st.subheader(f"📊 Channel-wise Performance Comparison")
         
-        # Filter for metric type
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col3:
-            metric_filter = st.radio(
-                "Select Metric",
-                options=['Value', 'Ltr'],
-                horizontal=True,
-                help="Toggle between Sales Value and Litres comparison"
-            )
-        
-        channel_perf_df = Channelwise_performance_data(start_date, end_date, town_code)
-        st.plotly_chart(create_Channel_performance_chart(channel_perf_df, metric_type=metric_filter), use_container_width=True, key="channel_performance_chart")
-
+       
         #channel wise growth percentage chart
-        st.markdown("---")
-        st.subheader(f"📈 Channel-wise Growth Percentage")
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col3:
-            metric_filter = st.radio(
-                "Select Metric for Growth",
-                options=['Value', 'Ltr'],
-                horizontal=True,
-                help="Toggle between Sales Value and Litres growth comparison"
-            )
+        leftcol,right_col = st.columns([1.5,1])
+        with leftcol:
+                col1, col2, col3 = st.columns([1, 2, 1])
+                with col3:
+                    metric_filter = st.radio(
+                        "Select Metric",
+                        options=['Value', 'Ltr'],
+                        horizontal=True,
+                        help="Toggle between Sales Value and Litres comparison"
+                    )
+            
+                channel_perf_df = Channelwise_performance_data(start_date, end_date, town_code)
+                st.plotly_chart(create_Channel_performance_chart(channel_perf_df, metric_type=metric_filter), use_container_width=True, key="channel_performance_chart")
 
-        channel_growth_df = Channelwise_performance_data(start_date, end_date, town_code)
-        st.plotly_chart(create_channel_wise_growth_chart(channel_growth_df, metric_type=metric_filter), use_container_width=True, key="channel_growth_chart")
-        # brand wise growth percentage chart
+        with right_col:
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col2:
+                metric_filter = st.radio(
+                    "Select Metric",
+                    options=['Value', 'Ltr'],
+                    horizontal=True,
+                    help="Toggle between Sales Value and Litres growth comparison"
+                )
+
+            channel_growth_df = Channelwise_performance_data(start_date, end_date, town_code)
+            st.plotly_chart(create_channel_wise_growth_chart(channel_growth_df, metric_type=metric_filter), use_container_width=True, key="channel_growth_chart")
+            # brand wise growth percentage chart
         st.markdown("---")
         st.subheader(f"📈 Brand-wise Growth Percentage")
         col1, col2, col3 = st.columns([1, 2, 1])
@@ -2786,7 +2761,7 @@ def main():
                 if col != 'Booker_Name':
                     pivot_df[col] = (pivot_df[col] * 100).round(2).astype(str) + "%"
 
-            st.dataframe(pivot_df, use_container_width=True, height=400)
+            st.dataframe(pivot_df, use_container_width=True, height=200)
 
             # Show detail on row selection
             if st.checkbox("Show Details"):
@@ -2805,6 +2780,11 @@ def main():
                                 'Total_Deliveries', 'HalfCtnDel', 'age']],
                         use_container_width=True
                     )
+            # MOPU,Total ORder, Drop Size Chart for Period
+            st.markdown("---")
+            st.subheader("📊 MOPU and Drop Size Analysis")
+            mopu_df = AOV_MOPU_data(town_code, months_back)
+            st.plotly_chart(AOV_MOPU_bar_chart(mopu_df), use_container_width=True, key="booker_mopu_chart")
 
     with tab2:
         st.subheader("🎯 Booker Performance Analysis")
@@ -2886,6 +2866,7 @@ def main():
                 key="brand_booker_treemap_chart"
             )
 
+            
 
 
 
