@@ -36,11 +36,11 @@ auth_dict = {u: v["password"] for u, v in VALID_USERS.items()}
 #     "port": int(os.getenv("DB_PORT", "3306")),
 # }
 DB_CONFIG = {
-    "username": "db42280",
-    "password": "admin2233",
-    "host": "db42280.public.databaseasp.net",
+    "username": "",
+    "password": "",
+    "host": "",
     "port": "3306",
-    "database": "db42280",
+    "database": "",
 }
 
 def get_engine():
