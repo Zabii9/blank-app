@@ -142,6 +142,830 @@ def read_sql_cached(query, db_name="db42280"):
     return pd.read_sql(query, eng)
 
 
+@st.cache_data(ttl=900)
+def fetch_account_last_update_data():
+    """Fetch latest Order Date by distributor account from ordered_vs_delivered_rows."""
+    query = """
+    SELECT
+        `Distributor Code` AS Distributor_Code,
+        MAX(`Order Date`) AS Last_Update_At
+    FROM ordered_vs_delivered_rows
+    WHERE `Distributor Code` IN ('D70002202', 'D70002246')
+      AND `Order Date` IS NOT NULL
+    GROUP BY `Distributor Code`
+    """
+    return pd.read_sql(query, get_engine())
+
+
+@st.cache_data(ttl=1800)
+def fetch_revenue_sparkline_series(end_date, town_code):
+    """Fetch monthly revenue trend from same month last year to selected end month."""
+    end_ts = pd.to_datetime(end_date, errors='coerce')
+    if pd.isna(end_ts):
+        return []
+
+    end_month_start = pd.Timestamp(end_ts).replace(day=1)
+    start_month_start = end_month_start - pd.DateOffset(years=1)
+
+    query = f"""
+    SELECT
+        DATE_FORMAT(`Delivery Date`, '%%Y-%%m-01') AS Month_Start,
+        SUM(`Delivered Amount` + `Total Discount`) AS Revenue
+    FROM ordered_vs_delivered_rows
+    WHERE `Distributor Code` = '{town_code}'
+      AND `Delivery Date` >= '{start_month_start.date()}'
+      AND `Delivery Date` < DATE_ADD('{end_month_start.date()}', INTERVAL 1 MONTH)
+    GROUP BY DATE_FORMAT(`Delivery Date`, '%%Y-%%m-01')
+    ORDER BY Month_Start
+    """
+
+    spark_df = read_sql_cached(query, "db42280")
+    if spark_df is None or spark_df.empty:
+        return []
+
+    spark_df = spark_df.copy()
+    spark_df['Month_Start'] = pd.to_datetime(spark_df['Month_Start'], errors='coerce')
+    spark_df['Revenue'] = pd.to_numeric(spark_df.get('Revenue', 0), errors='coerce').fillna(0)
+    spark_df = spark_df.dropna(subset=['Month_Start'])
+
+    month_range = pd.date_range(start=start_month_start, end=end_month_start, freq='MS')
+    month_df = pd.DataFrame({'Month_Start': month_range})
+    spark_df = month_df.merge(
+        spark_df[['Month_Start', 'Revenue']],
+        on='Month_Start',
+        how='left'
+    )
+    spark_df['Revenue'] = pd.to_numeric(spark_df['Revenue'], errors='coerce').fillna(0)
+    return spark_df['Revenue'].tolist()
+
+
+@st.cache_data(ttl=1800)
+def fetch_kpi_sparkline_series(end_date, town_code):
+    """Fetch monthly sparkline series (Revenue, Litres, Orders, AOV) from same month last year to selected end month."""
+    end_ts = pd.to_datetime(end_date, errors='coerce')
+    if pd.isna(end_ts):
+        return {"revenue": [], "litres": [], "orders": [], "aov": []}
+
+    end_month_start = pd.Timestamp(end_ts).replace(day=1)
+    start_month_start = end_month_start - pd.DateOffset(years=1)
+
+    query = f"""
+    SELECT
+        DATE_FORMAT(`Delivery Date`, '%%Y-%%m-01') AS Month_Start,
+        SUM(`Delivered Amount` + `Total Discount`) AS Revenue,
+        SUM(CASE WHEN COALESCE(`Delivered (Litres)`, 0) = 0 THEN COALESCE(`Delivered (Kg)`, 0) ELSE COALESCE(`Delivered (Litres)`, 0) END) AS Litres,
+        COUNT(DISTINCT `Invoice Number`) AS Orders
+    FROM ordered_vs_delivered_rows
+    WHERE `Distributor Code` = '{town_code}'
+      AND `Delivery Date` >= '{start_month_start.date()}'
+      AND `Delivery Date` < DATE_ADD('{end_month_start.date()}', INTERVAL 1 MONTH)
+    GROUP BY DATE_FORMAT(`Delivery Date`, '%%Y-%%m-01')
+    ORDER BY Month_Start
+    """
+
+    spark_df = read_sql_cached(query, "db42280")
+    month_range = pd.date_range(start=start_month_start, end=end_month_start, freq='MS')
+    month_df = pd.DataFrame({'Month_Start': month_range})
+
+    if spark_df is None or spark_df.empty:
+        empty_vals = [0.0] * len(month_df)
+        return {"revenue": empty_vals, "litres": empty_vals, "orders": empty_vals, "aov": empty_vals}
+
+    spark_df = spark_df.copy()
+    spark_df['Month_Start'] = pd.to_datetime(spark_df['Month_Start'], errors='coerce')
+    for col in ['Revenue', 'Litres', 'Orders']:
+        spark_df[col] = pd.to_numeric(spark_df.get(col, 0), errors='coerce').fillna(0)
+    spark_df = spark_df.dropna(subset=['Month_Start'])
+
+    spark_df = month_df.merge(
+        spark_df[['Month_Start', 'Revenue', 'Litres', 'Orders']],
+        on='Month_Start',
+        how='left'
+    )
+    for col in ['Revenue', 'Litres', 'Orders']:
+        spark_df[col] = pd.to_numeric(spark_df[col], errors='coerce').fillna(0)
+
+    spark_df['AOV'] = np.where(
+        spark_df['Orders'] > 0,
+        spark_df['Revenue'] / spark_df['Orders'],
+        0,
+    )
+
+    return {
+        "revenue": spark_df['Revenue'].tolist(),
+        "litres": spark_df['Litres'].tolist(),
+        "orders": spark_df['Orders'].tolist(),
+        "aov": spark_df['AOV'].tolist(),
+    }
+
+
+@st.cache_data(ttl=1800)
+def fetch_inventory_kpi_data(end_date, town_code):
+    """Fetch inventory KPIs using end_stock_summary and sales from ordered_vs_delivered_rows."""
+    end_ts = pd.to_datetime(end_date, errors='coerce')
+    if pd.isna(end_ts):
+        return None
+
+    end_date_str = str(pd.Timestamp(end_ts).date())
+
+    dates_query = f"""
+    SELECT
+        MAX(CASE WHEN report_date <= '{end_date_str}' THEN report_date END) AS latest_report_date,
+        MAX(CASE
+                WHEN report_date < (
+                    SELECT MAX(report_date)
+                    FROM end_stock_summary
+                    WHERE distributor_code = '{town_code}'
+                      AND report_date <= '{end_date_str}'
+                ) THEN report_date
+            END) AS prev_report_date
+    FROM end_stock_summary
+    WHERE distributor_code = '{town_code}'
+    """
+    dates_df = read_sql_cached(dates_query, "db42280")
+    if dates_df is None or dates_df.empty or pd.isna(dates_df.loc[0, 'latest_report_date']):
+        return None
+
+    latest_report_date = pd.to_datetime(dates_df.loc[0, 'latest_report_date'], errors='coerce')
+    prev_report_date = pd.to_datetime(dates_df.loc[0, 'prev_report_date'], errors='coerce')
+    if pd.isna(latest_report_date):
+        return None
+
+    def _fetch_stock_snapshot(report_date_value):
+        if pd.isna(report_date_value):
+            return pd.DataFrame(columns=['sku_code', 'stock_value'])
+        report_date_str = str(pd.Timestamp(report_date_value).date())
+        q = f"""
+        SELECT
+            sku_code,
+            ROUND(SUM(COALESCE(value, 0)), 4) AS stock_value
+        FROM end_stock_summary
+        WHERE distributor_code = '{town_code}'
+          AND report_date = '{report_date_str}'
+          AND LOWER(COALESCE(unit, '')) = 'value'
+        GROUP BY sku_code
+        """
+        snapshot_df = read_sql_cached(q, "db42280")
+        if snapshot_df is None:
+            return pd.DataFrame(columns=['sku_code', 'stock_value'])
+        snapshot_df = snapshot_df.copy()
+        snapshot_df['sku_code'] = snapshot_df.get('sku_code', '').astype(str)
+        snapshot_df['stock_value'] = pd.to_numeric(snapshot_df.get('stock_value', 0), errors='coerce').fillna(0)
+        return snapshot_df
+
+    def _fetch_sales_window(end_window_date, window_days):
+        if pd.isna(end_window_date):
+            return pd.DataFrame(columns=['sku_code', 'sales_value'])
+        end_window_ts = pd.Timestamp(end_window_date).date()
+        start_window_ts = (pd.Timestamp(end_window_date) - pd.Timedelta(days=window_days - 1)).date()
+        q = f"""
+        SELECT
+            `SKU Code` AS sku_code,
+            ROUND(SUM(COALESCE(`Delivered Amount`, 0) + COALESCE(`Total Discount`, 0)), 4) AS sales_value
+        FROM ordered_vs_delivered_rows
+        WHERE `Distributor Code` = '{town_code}'
+          AND `Delivery Date` BETWEEN '{start_window_ts}' AND '{end_window_ts}'
+        GROUP BY `SKU Code`
+        """
+        sales_df = read_sql_cached(q, "db42280")
+        if sales_df is None:
+            return pd.DataFrame(columns=['sku_code', 'sales_value'])
+        sales_df = sales_df.copy()
+        sales_df['sku_code'] = sales_df.get('sku_code', '').astype(str)
+        sales_df['sales_value'] = pd.to_numeric(sales_df.get('sales_value', 0), errors='coerce').fillna(0)
+        return sales_df
+
+    stock_curr = _fetch_stock_snapshot(latest_report_date)
+    stock_prev = _fetch_stock_snapshot(prev_report_date)
+
+    sales_90_curr = _fetch_sales_window(latest_report_date, 90).rename(columns={'sales_value': 'sales_90'})
+    sales_90_prev = _fetch_sales_window(prev_report_date, 90).rename(columns={'sales_value': 'sales_90'}) if pd.notna(prev_report_date) else pd.DataFrame(columns=['sku_code', 'sales_90'])
+    sales_30_curr = _fetch_sales_window(latest_report_date, 30).rename(columns={'sales_value': 'sales_30'})
+    sales_30_prev = _fetch_sales_window(prev_report_date, 30).rename(columns={'sales_value': 'sales_30'}) if pd.notna(prev_report_date) else pd.DataFrame(columns=['sku_code', 'sales_30'])
+
+    def _compute_metrics(stock_df, sales_90_df, sales_30_df):
+        if stock_df is None or stock_df.empty:
+            return {
+                'total_skus': 0,
+                'current_inventory_value': 0.0,
+                'in_stock_rate': 0.0,
+                'oos_skus': 0,
+                'avg_days_cover': 0.0,
+                'slow_movers': 0,
+            }
+
+        merged = stock_df.copy()
+        merged = merged.merge(sales_90_df, on='sku_code', how='left') if sales_90_df is not None and not sales_90_df.empty else merged
+        merged = merged.merge(sales_30_df, on='sku_code', how='left') if sales_30_df is not None and not sales_30_df.empty else merged
+        if 'sales_90' not in merged.columns:
+            merged['sales_90'] = 0
+        if 'sales_30' not in merged.columns:
+            merged['sales_30'] = 0
+        merged['sales_90'] = pd.to_numeric(merged['sales_90'], errors='coerce').fillna(0)
+        merged['sales_30'] = pd.to_numeric(merged['sales_30'], errors='coerce').fillna(0)
+        merged['stock_value'] = pd.to_numeric(merged['stock_value'], errors='coerce').fillna(0)
+
+        total_skus = int(merged['sku_code'].nunique())
+        current_inventory_value = float(merged['stock_value'].sum())
+        in_stock_skus = int((merged['stock_value'] > 0).sum())
+        oos_skus = int((merged['stock_value'] <= 0).sum())
+        in_stock_rate = (in_stock_skus / total_skus * 100) if total_skus > 0 else 0.0
+
+        merged['daily_sales_90'] = merged['sales_90'] / 90.0
+        merged['days_cover'] = np.where(
+            (merged['stock_value'] > 0) & (merged['daily_sales_90'] > 0),
+            merged['stock_value'] / merged['daily_sales_90'],
+            np.nan,
+        )
+        valid_cover_df = merged.loc[
+            (pd.to_numeric(merged['stock_value'], errors='coerce').fillna(0) > 0)
+            & (pd.to_numeric(merged['sales_90'], errors='coerce').fillna(0) > 0),
+            ['sku_code', 'sales_90', 'days_cover']
+        ].copy()
+
+        if valid_cover_df.empty:
+            avg_days_cover = 0.0
+        else:
+            valid_cover_df['sales_90'] = pd.to_numeric(valid_cover_df['sales_90'], errors='coerce').fillna(0)
+            valid_cover_df['days_cover'] = pd.to_numeric(valid_cover_df['days_cover'], errors='coerce').fillna(0)
+            total_sales_90 = float(valid_cover_df['sales_90'].sum())
+            if total_sales_90 > 0:
+                valid_cover_df['sku_contribution'] = valid_cover_df['sales_90'] / total_sales_90
+                avg_days_cover = float((valid_cover_df['days_cover'] * valid_cover_df['sku_contribution']).sum())
+            else:
+                avg_days_cover = 0.0
+
+        slow_movers = int(((merged['stock_value'] > 0) & (merged['sales_30'] <= 0)).sum())
+
+        return {
+            'total_skus': total_skus,
+            'current_inventory_value': float(current_inventory_value),
+            'in_stock_rate': float(in_stock_rate),
+            'oos_skus': oos_skus,
+            'avg_days_cover': float(avg_days_cover),
+            'slow_movers': slow_movers,
+        }
+
+    current_metrics = _compute_metrics(stock_curr, sales_90_curr, sales_30_curr)
+    prev_metrics = _compute_metrics(stock_prev, sales_90_prev, sales_30_prev) if pd.notna(prev_report_date) else None
+
+    return {
+        'latest_report_date': pd.Timestamp(latest_report_date).date(),
+        'prev_report_date': (pd.Timestamp(prev_report_date).date() if pd.notna(prev_report_date) else None),
+        'current': current_metrics,
+        'previous': prev_metrics,
+    }
+
+
+@st.cache_data(ttl=1800)
+def fetch_inventory_ytd_month_end_sparkline(end_date, town_code):
+    """Fetch YTD month-end inventory values for sparkline in Inventory tab."""
+    end_ts = pd.to_datetime(end_date, errors='coerce')
+    if pd.isna(end_ts):
+        return []
+
+    end_day = pd.Timestamp(end_ts).date()
+    year_start = pd.Timestamp(end_ts).replace(month=1, day=1).date()
+    end_month_start = pd.Timestamp(end_ts).replace(day=1)
+
+    query = f"""
+    SELECT
+        m.month_start AS Month_Start,
+        ROUND(SUM(COALESCE(s.value, 0)), 4) AS Inventory_Value
+    FROM (
+        SELECT
+            DATE_FORMAT(report_date, '%%Y-%%m-01') AS month_start,
+            MAX(report_date) AS month_last_date
+        FROM end_stock_summary
+        WHERE distributor_code = '{town_code}'
+          AND LOWER(COALESCE(unit, '')) = 'value'
+          AND report_date BETWEEN '{year_start}' AND '{end_day}'
+        GROUP BY DATE_FORMAT(report_date, '%%Y-%%m-01')
+    ) m
+    INNER JOIN end_stock_summary s
+        ON s.report_date = m.month_last_date
+       AND s.distributor_code = '{town_code}'
+       AND LOWER(COALESCE(s.unit, '')) = 'value'
+    GROUP BY m.month_start
+    ORDER BY m.month_start
+    """
+
+    spark_df = read_sql_cached(query, "db42280")
+    month_range = pd.date_range(start=pd.Timestamp(year_start), end=end_month_start, freq='MS')
+    month_df = pd.DataFrame({'Month_Start': month_range})
+
+    if spark_df is None or spark_df.empty:
+        return [0.0] * len(month_df)
+
+    spark_df = spark_df.copy()
+    spark_df['Month_Start'] = pd.to_datetime(spark_df.get('Month_Start'), errors='coerce')
+    spark_df['Inventory_Value'] = pd.to_numeric(spark_df.get('Inventory_Value', 0), errors='coerce').fillna(0)
+    spark_df = spark_df.dropna(subset=['Month_Start'])
+
+    spark_df = month_df.merge(
+        spark_df[['Month_Start', 'Inventory_Value']],
+        on='Month_Start',
+        how='left'
+    )
+    spark_df['Inventory_Value'] = pd.to_numeric(spark_df['Inventory_Value'], errors='coerce').fillna(0)
+    return spark_df['Inventory_Value'].tolist()
+
+
+@st.cache_data(ttl=1800)
+def fetch_inventory_chart_data(end_date, town_code):
+    """Fetch chart data for Inventory tab: stock movement trend and days cover by category."""
+    end_ts = pd.to_datetime(end_date, errors='coerce')
+    if pd.isna(end_ts):
+        return {'trend': pd.DataFrame(), 'days_cover': pd.DataFrame()}
+
+    end_day = pd.Timestamp(end_ts).date()
+    start_30 = (pd.Timestamp(end_ts) - pd.Timedelta(days=29)).date()
+    start_31 = (pd.Timestamp(end_ts) - pd.Timedelta(days=30)).date()
+
+    stock_daily_q = f"""
+    SELECT
+        report_date AS Report_Date,
+        ROUND(SUM(COALESCE(value, 0)), 4) AS Stock_Value
+    FROM end_stock_summary
+    WHERE distributor_code = '{town_code}'
+      AND LOWER(COALESCE(unit, '')) = 'value'
+      AND report_date BETWEEN '{start_31}' AND '{end_day}'
+    GROUP BY report_date
+    ORDER BY report_date
+    """
+    stock_daily_df = read_sql_cached(stock_daily_q, "db42280")
+
+    sales_daily_q = f"""
+    SELECT
+        `Delivery Date` AS Report_Date,
+        ROUND(SUM(COALESCE(`Delivered Amount`, 0) + COALESCE(`Total Discount`, 0)), 4) AS Outflow_Value
+    FROM ordered_vs_delivered_rows
+    WHERE `Distributor Code` = '{town_code}'
+      AND `Delivery Date` BETWEEN '{start_30}' AND '{end_day}'
+    GROUP BY `Delivery Date`
+    ORDER BY `Delivery Date`
+    """
+    sales_daily_df = read_sql_cached(sales_daily_q, "db42280")
+
+    stock_daily_df = stock_daily_df if stock_daily_df is not None else pd.DataFrame(columns=['Report_Date', 'Stock_Value'])
+    sales_daily_df = sales_daily_df if sales_daily_df is not None else pd.DataFrame(columns=['Report_Date', 'Outflow_Value'])
+
+    stock_daily_df = stock_daily_df.copy()
+    stock_daily_df['Report_Date'] = pd.to_datetime(stock_daily_df.get('Report_Date'), errors='coerce')
+    stock_daily_df['Stock_Value'] = pd.to_numeric(stock_daily_df.get('Stock_Value', 0), errors='coerce').fillna(0)
+    stock_daily_df = stock_daily_df.dropna(subset=['Report_Date'])
+
+    full_days_31 = pd.date_range(start=pd.Timestamp(start_31), end=pd.Timestamp(end_day), freq='D')
+    stock_daily_df = pd.DataFrame({'Report_Date': full_days_31}).merge(stock_daily_df, on='Report_Date', how='left')
+    stock_daily_df['Stock_Value'] = pd.to_numeric(stock_daily_df['Stock_Value'], errors='coerce').fillna(0)
+    stock_daily_df['Prev_Stock'] = stock_daily_df['Stock_Value'].shift(1)
+    stock_daily_df['Prev_Stock'] = pd.to_numeric(stock_daily_df['Prev_Stock'], errors='coerce').fillna(stock_daily_df['Stock_Value'])
+    stock_daily_df['Inflow_Value'] = (stock_daily_df['Stock_Value'] - stock_daily_df['Prev_Stock']).clip(lower=0)
+    trend_df = stock_daily_df[stock_daily_df['Report_Date'] >= pd.Timestamp(start_30)][['Report_Date', 'Inflow_Value']].copy()
+
+    sales_daily_df = sales_daily_df.copy()
+    sales_daily_df['Report_Date'] = pd.to_datetime(sales_daily_df.get('Report_Date'), errors='coerce')
+    sales_daily_df['Outflow_Value'] = pd.to_numeric(sales_daily_df.get('Outflow_Value', 0), errors='coerce').fillna(0)
+    sales_daily_df = sales_daily_df.dropna(subset=['Report_Date'])
+    full_days_30 = pd.date_range(start=pd.Timestamp(start_30), end=pd.Timestamp(end_day), freq='D')
+    sales_daily_df = pd.DataFrame({'Report_Date': full_days_30}).merge(sales_daily_df, on='Report_Date', how='left')
+    sales_daily_df['Outflow_Value'] = pd.to_numeric(sales_daily_df['Outflow_Value'], errors='coerce').fillna(0)
+
+    trend_df = trend_df.merge(sales_daily_df[['Report_Date', 'Outflow_Value']], on='Report_Date', how='left')
+    trend_df['Outflow_Value'] = pd.to_numeric(trend_df['Outflow_Value'], errors='coerce').fillna(0)
+
+    latest_stock_date_q = f"""
+    SELECT MAX(report_date) AS latest_report_date
+    FROM end_stock_summary
+    WHERE distributor_code = '{town_code}'
+      AND report_date <= '{end_day}'
+    """
+    latest_stock_date_df = read_sql_cached(latest_stock_date_q, "db42280")
+    latest_stock_date = None
+    if latest_stock_date_df is not None and not latest_stock_date_df.empty:
+        latest_stock_date = pd.to_datetime(latest_stock_date_df.loc[0, 'latest_report_date'], errors='coerce')
+
+    if pd.isna(latest_stock_date):
+        return {'trend': trend_df, 'days_cover': pd.DataFrame()}
+
+    latest_stock_str = str(pd.Timestamp(latest_stock_date).date())
+    days_cover_q = f"""
+    WITH stock_sku AS (
+        SELECT
+            sku_code,
+            ROUND(SUM(COALESCE(value, 0)), 4) AS stock_value
+        FROM end_stock_summary
+        WHERE distributor_code = '{town_code}'
+          AND report_date = '{latest_stock_str}'
+          AND LOWER(COALESCE(unit, '')) = 'value'
+        GROUP BY sku_code
+    ),
+    sales_30_sku AS (
+        SELECT
+            `SKU Code` AS sku_code,
+            ROUND(SUM(COALESCE(`Delivered Amount`, 0) + COALESCE(`Total Discount`, 0)), 4) AS sales_30
+        FROM ordered_vs_delivered_rows
+        WHERE `Distributor Code` = '{town_code}'
+          AND `Delivery Date` BETWEEN '{start_30}' AND '{end_day}'
+        GROUP BY `SKU Code`
+    ),
+    latest_sku_date AS (
+        SELECT
+            `SKU Code` AS sku_code,
+            MAX(`Delivery Date`) AS max_delivery_date
+        FROM ordered_vs_delivered_rows
+        WHERE `Distributor Code` = '{town_code}'
+        GROUP BY `SKU Code`
+    ),
+    sku_category AS (
+        SELECT
+            o.`SKU Code` AS sku_code,
+            COALESCE(NULLIF(TRIM(o.`Category Name`), ''), 'Unknown') AS category_name
+        FROM ordered_vs_delivered_rows o
+        INNER JOIN latest_sku_date d
+            ON d.sku_code = o.`SKU Code`
+           AND d.max_delivery_date = o.`Delivery Date`
+        WHERE o.`Distributor Code` = '{town_code}'
+        GROUP BY o.`SKU Code`, COALESCE(NULLIF(TRIM(o.`Category Name`), ''), 'Unknown')
+    )
+    SELECT
+        COALESCE(c.category_name, 'Unknown') AS Category,
+        ROUND(SUM(COALESCE(s.stock_value, 0)), 4) AS Stock_Value,
+        ROUND(SUM(COALESCE(x.sales_30, 0)), 4) AS Sales_30,
+        ROUND(
+            CASE
+                WHEN SUM(COALESCE(x.sales_30, 0)) > 0 THEN SUM(COALESCE(s.stock_value, 0)) / (SUM(COALESCE(x.sales_30, 0)) / 30.0)
+                ELSE NULL
+            END,
+            2
+        ) AS Days_Cover
+    FROM stock_sku s
+    LEFT JOIN sales_30_sku x ON x.sku_code = s.sku_code
+    LEFT JOIN sku_category c ON c.sku_code = s.sku_code
+    GROUP BY COALESCE(c.category_name, 'Unknown')
+    ORDER BY Days_Cover DESC
+    """
+    days_cover_df = read_sql_cached(days_cover_q, "db42280")
+    if days_cover_df is None:
+        days_cover_df = pd.DataFrame(columns=['Category', 'Stock_Value', 'Sales_30', 'Days_Cover'])
+
+    days_cover_df = days_cover_df.copy()
+    days_cover_df['Category'] = days_cover_df.get('Category', '').astype(str)
+    days_cover_df['Days_Cover'] = pd.to_numeric(days_cover_df.get('Days_Cover', 0), errors='coerce').fillna(0)
+
+    return {'trend': trend_df, 'days_cover': days_cover_df}
+
+
+@st.cache_data(ttl=1800)
+def fetch_inventory_cover_bucket_matrix(end_date, town_code, bucket_thresholds=(7, 15, 30, 45, 60)):
+    """Build Salesflo-style stock cover day bucket matrix for inventory value."""
+    end_ts = pd.to_datetime(end_date, errors='coerce')
+    if pd.isna(end_ts):
+        return {'table': pd.DataFrame(), 'percentages': {}}
+
+    end_day = pd.Timestamp(end_ts).date()
+    start_90 = (pd.Timestamp(end_ts) - pd.Timedelta(days=89)).date()
+
+    distributor_filter = ""
+    if town_code and str(town_code).lower() != 'all':
+        distributor_filter = f" AND distributor_code = '{town_code}' "
+
+    sales_distributor_filter = ""
+    if town_code and str(town_code).lower() != 'all':
+        sales_distributor_filter = f" AND `Distributor Code` = '{town_code}' "
+
+    query = f"""
+    WITH latest_date AS (
+        SELECT distributor_code, MAX(report_date) AS latest_report_date
+        FROM end_stock_summary
+        WHERE report_date <= '{end_day}'
+          {distributor_filter}
+        GROUP BY distributor_code
+    ),
+    stock_sku AS (
+        SELECT
+            s.distributor_code,
+            s.sku_code,
+            ROUND(SUM(COALESCE(s.value, 0)), 4) AS stock_value
+        FROM end_stock_summary s
+        INNER JOIN latest_date d
+            ON d.distributor_code = s.distributor_code
+           AND d.latest_report_date = s.report_date
+        WHERE LOWER(COALESCE(s.unit, '')) = 'value'
+        GROUP BY s.distributor_code, s.sku_code
+    ),
+    sales_90_sku AS (
+        SELECT
+            `Distributor Code` AS distributor_code,
+            `SKU Code` AS sku_code,
+            ROUND(SUM(COALESCE(`Delivered Amount`, 0) + COALESCE(`Total Discount`, 0)), 4) AS sales_90
+        FROM ordered_vs_delivered_rows
+        WHERE `Delivery Date` BETWEEN '{start_90}' AND '{end_day}'
+          {sales_distributor_filter}
+        GROUP BY `Distributor Code`, `SKU Code`
+    )
+    SELECT
+        s.distributor_code,
+        s.sku_code,
+        s.stock_value,
+        COALESCE(x.sales_90, 0) AS sales_90
+    FROM stock_sku s
+    LEFT JOIN sales_90_sku x
+      ON x.distributor_code = s.distributor_code
+     AND x.sku_code = s.sku_code
+    """
+
+    base_df = read_sql_cached(query, "db42280")
+    if base_df is None or base_df.empty:
+        return {'table': pd.DataFrame(), 'percentages': {}}
+
+    df = base_df.copy()
+    df['distributor_code'] = df.get('distributor_code', '').astype(str)
+    df['stock_value'] = pd.to_numeric(df.get('stock_value', 0), errors='coerce').fillna(0)
+    df['sales_90'] = pd.to_numeric(df.get('sales_90', 0), errors='coerce').fillna(0)
+
+    df = df[df['stock_value'] > 0].copy()
+    if df.empty:
+        return {'table': pd.DataFrame(), 'percentages': {}}
+
+    df['cover_days'] = np.where(df['sales_90'] > 0, df['stock_value'] / (df['sales_90'] / 90.0), np.inf)
+
+    account_map = {
+        'D70002202': 'Karachi',
+        'D70002246': 'Lahore',
+    }
+    df['Account'] = df['distributor_code'].map(account_map).fillna(df['distributor_code'])
+
+    try:
+        t1, t2, t3, t4, t5 = [float(x) for x in bucket_thresholds]
+    except Exception:
+        t1, t2, t3, t4, t5 = 7.0, 15.0, 30.0, 45.0, 60.0
+    thresholds_sorted = sorted([t1, t2, t3, t4, t5])
+    t1, t2, t3, t4, t5 = thresholds_sorted
+
+    bucket_columns = [
+        f'Inventory <{int(t1)}',
+        f'Inventory {int(t1)}-{int(t2)}',
+        f'Inventory {int(t2)}-{int(t3)}',
+        f'Inventory {int(t3)}-{int(t4)}',
+        f'Inventory {int(t4)}-{int(t5)}',
+        f'Inventory {int(t5)}+',
+        'Zero Sale',
+    ]
+
+    for col in bucket_columns:
+        df[col] = 0.0
+
+    df.loc[(df['sales_90'] > 0) & (df['cover_days'] < t1), bucket_columns[0]] = df['stock_value']
+    df.loc[(df['sales_90'] > 0) & (df['cover_days'] >= t1) & (df['cover_days'] < t2), bucket_columns[1]] = df['stock_value']
+    df.loc[(df['sales_90'] > 0) & (df['cover_days'] >= t2) & (df['cover_days'] < t3), bucket_columns[2]] = df['stock_value']
+    df.loc[(df['sales_90'] > 0) & (df['cover_days'] >= t3) & (df['cover_days'] < t4), bucket_columns[3]] = df['stock_value']
+    df.loc[(df['sales_90'] > 0) & (df['cover_days'] >= t4) & (df['cover_days'] < t5), bucket_columns[4]] = df['stock_value']
+    df.loc[(df['sales_90'] > 0) & (df['cover_days'] >= t5), bucket_columns[5]] = df['stock_value']
+    df.loc[df['sales_90'] <= 0, 'Zero Sale'] = df['stock_value']
+
+    agg_cols = ['stock_value'] + bucket_columns
+    grouped = df.groupby('Account', as_index=False)[agg_cols].sum()
+    grouped = grouped.rename(columns={'stock_value': 'Total Inventory'})
+
+    table_df = grouped.copy()
+
+    grand_total = float(grouped['Total Inventory'].sum()) if not grouped.empty else 0.0
+    percentages = {}
+    for col in bucket_columns:
+        col_total = float(grouped[col].sum()) if not grouped.empty else 0.0
+        percentages[col] = (col_total / grand_total * 100.0) if grand_total > 0 else 0.0
+
+    return {'table': table_df, 'percentages': percentages, 'bucket_columns': bucket_columns}
+
+
+@st.cache_data(ttl=1800)
+def fetch_inventory_health_data(end_date, town_code):
+    """Compute inventory health metrics for Inventory tab."""
+    end_ts = pd.to_datetime(end_date, errors='coerce')
+    if pd.isna(end_ts):
+        return None
+
+    end_day = pd.Timestamp(end_ts).date()
+    start_30 = (pd.Timestamp(end_ts) - pd.Timedelta(days=29)).date()
+    start_90 = (pd.Timestamp(end_ts) - pd.Timedelta(days=89)).date()
+
+    latest_date_q = f"""
+    SELECT MAX(report_date) AS latest_report_date
+    FROM end_stock_summary
+    WHERE distributor_code = '{town_code}'
+      AND report_date <= '{end_day}'
+    """
+    latest_date_df = read_sql_cached(latest_date_q, "db42280")
+    if latest_date_df is None or latest_date_df.empty or pd.isna(latest_date_df.loc[0, 'latest_report_date']):
+        return None
+
+    latest_report_date = pd.to_datetime(latest_date_df.loc[0, 'latest_report_date'], errors='coerce')
+    if pd.isna(latest_report_date):
+        return None
+    latest_report_day = pd.Timestamp(latest_report_date).date()
+
+    stock_daily_q = f"""
+    SELECT
+        report_date AS Report_Date,
+        ROUND(SUM(COALESCE(value, 0)), 4) AS Stock_Value
+    FROM end_stock_summary
+    WHERE distributor_code = '{town_code}'
+      AND LOWER(COALESCE(unit, '')) = 'value'
+      AND report_date BETWEEN '{start_90}' AND '{latest_report_day}'
+    GROUP BY report_date
+    ORDER BY report_date
+    """
+    stock_daily_df = read_sql_cached(stock_daily_q, "db42280")
+    if stock_daily_df is None:
+        stock_daily_df = pd.DataFrame(columns=['Report_Date', 'Stock_Value'])
+
+    stock_daily_df = stock_daily_df.copy()
+    stock_daily_df['Report_Date'] = pd.to_datetime(stock_daily_df.get('Report_Date'), errors='coerce')
+    stock_daily_df['Stock_Value'] = pd.to_numeric(stock_daily_df.get('Stock_Value', 0), errors='coerce').fillna(0)
+    stock_daily_df = stock_daily_df.dropna(subset=['Report_Date']).sort_values('Report_Date')
+
+    avg_stock_90 = float(stock_daily_df['Stock_Value'].mean()) if not stock_daily_df.empty else 0.0
+    avg_stock_30 = float(
+        stock_daily_df.loc[stock_daily_df['Report_Date'] >= pd.Timestamp(start_30), 'Stock_Value'].mean()
+    ) if not stock_daily_df.empty else 0.0
+
+    sales_q = f"""
+    SELECT
+        ROUND(SUM(CASE WHEN `Delivery Date` BETWEEN '{start_90}' AND '{end_day}'
+            THEN COALESCE(`Delivered Amount`, 0) + COALESCE(`Total Discount`, 0) ELSE 0 END), 4) AS Sales_90,
+        ROUND(SUM(CASE WHEN `Delivery Date` BETWEEN '{start_30}' AND '{end_day}'
+            THEN COALESCE(`Delivered Amount`, 0) + COALESCE(`Total Discount`, 0) ELSE 0 END), 4) AS Sales_30
+    FROM ordered_vs_delivered_rows
+    WHERE `Distributor Code` = '{town_code}'
+    """
+    sales_df = read_sql_cached(sales_q, "db42280")
+    sales_90 = 0.0
+    sales_30 = 0.0
+    if sales_df is not None and not sales_df.empty:
+        sales_90 = float(pd.to_numeric(sales_df.loc[0, 'Sales_90'], errors='coerce') or 0.0)
+        sales_30 = float(pd.to_numeric(sales_df.loc[0, 'Sales_30'], errors='coerce') or 0.0)
+
+    sku_stock_q = f"""
+    SELECT
+        sku_code,
+        ROUND(SUM(COALESCE(value, 0)), 4) AS stock_value
+    FROM end_stock_summary
+    WHERE distributor_code = '{town_code}'
+      AND report_date = '{latest_report_day}'
+      AND LOWER(COALESCE(unit, '')) = 'value'
+    GROUP BY sku_code
+    """
+    sku_sales_90_q = f"""
+    SELECT
+        `SKU Code` AS sku_code,
+        ROUND(SUM(COALESCE(`Delivered Amount`, 0) + COALESCE(`Total Discount`, 0)), 4) AS sales_90
+    FROM ordered_vs_delivered_rows
+    WHERE `Distributor Code` = '{town_code}'
+      AND `Delivery Date` BETWEEN '{start_90}' AND '{end_day}'
+    GROUP BY `SKU Code`
+    """
+    sku_sales_30_q = f"""
+    SELECT
+        `SKU Code` AS sku_code,
+        ROUND(SUM(COALESCE(`Delivered Amount`, 0) + COALESCE(`Total Discount`, 0)), 4) AS sales_30
+    FROM ordered_vs_delivered_rows
+    WHERE `Distributor Code` = '{town_code}'
+      AND `Delivery Date` BETWEEN '{start_30}' AND '{end_day}'
+    GROUP BY `SKU Code`
+    """
+    sku_name_map_q = f"""
+    SELECT
+        `SKU Code` AS sku_code,
+        MAX(`SKU Name`) AS sku_name
+    FROM ordered_vs_delivered_rows
+    WHERE `Distributor Code` = '{town_code}'
+      AND `Delivery Date` BETWEEN '{start_90}' AND '{end_day}'
+      AND `SKU Name` IS NOT NULL
+      AND TRIM(`SKU Name`) <> ''
+    GROUP BY `SKU Code`
+    """
+
+    sku_stock_df = read_sql_cached(sku_stock_q, "db42280")
+    sku_sales_90_df = read_sql_cached(sku_sales_90_q, "db42280")
+    sku_sales_30_df = read_sql_cached(sku_sales_30_q, "db42280")
+    try:
+        sku_name_map_df = read_sql_cached(sku_name_map_q, "db42280")
+    except Exception:
+        sku_name_map_df = pd.DataFrame(columns=['sku_code', 'sku_name'])
+
+    if sku_stock_df is None:
+        sku_stock_df = pd.DataFrame(columns=['sku_code', 'stock_value'])
+    if sku_sales_90_df is None:
+        sku_sales_90_df = pd.DataFrame(columns=['sku_code', 'sales_90'])
+    if sku_sales_30_df is None:
+        sku_sales_30_df = pd.DataFrame(columns=['sku_code', 'sales_30'])
+    if sku_name_map_df is None:
+        sku_name_map_df = pd.DataFrame(columns=['sku_code', 'sku_name'])
+
+    sku_stock_df = sku_stock_df.copy()
+    sku_stock_df['sku_code'] = sku_stock_df.get('sku_code', '').astype(str)
+    sku_stock_df['stock_value'] = pd.to_numeric(sku_stock_df.get('stock_value', 0), errors='coerce').fillna(0)
+
+    sku_sales_90_df = sku_sales_90_df.copy()
+    sku_sales_90_df['sku_code'] = sku_sales_90_df.get('sku_code', '').astype(str)
+    sku_sales_90_df['sales_90'] = pd.to_numeric(sku_sales_90_df.get('sales_90', 0), errors='coerce').fillna(0)
+
+    sku_sales_30_df = sku_sales_30_df.copy()
+    sku_sales_30_df['sku_code'] = sku_sales_30_df.get('sku_code', '').astype(str)
+    sku_sales_30_df['sales_30'] = pd.to_numeric(sku_sales_30_df.get('sales_30', 0), errors='coerce').fillna(0)
+
+    sku_name_map_df = sku_name_map_df.copy()
+    sku_name_map_df['sku_code'] = sku_name_map_df.get('sku_code', '').astype(str)
+    sku_name_map_df['sku_name'] = sku_name_map_df.get('sku_name', '').astype(str)
+    sku_name_map_df['sku_name'] = sku_name_map_df['sku_name'].str.strip()
+    sku_name_map_df = sku_name_map_df[sku_name_map_df['sku_name'] != '']
+    sku_name_map_df = sku_name_map_df.drop_duplicates(subset=['sku_code'], keep='first')
+
+    merged = sku_stock_df.merge(sku_sales_90_df, on='sku_code', how='left').merge(sku_sales_30_df, on='sku_code', how='left')
+    merged['sales_90'] = pd.to_numeric(merged.get('sales_90', 0), errors='coerce').fillna(0)
+    merged['sales_30'] = pd.to_numeric(merged.get('sales_30', 0), errors='coerce').fillna(0)
+
+    total_stock_value = float(merged['stock_value'].sum()) if not merged.empty else 0.0
+    total_sales_90_for_contribution = float(merged['sales_90'].sum()) if not merged.empty else 0.0
+
+    par_target_cover_days = 14.0
+    if merged.empty:
+        par_level_inventory_value = 0.0
+    else:
+        merged['daily_sales_90'] = pd.to_numeric(merged['sales_90'], errors='coerce').fillna(0) / 90.0
+        par_level_inventory_value = float((merged['daily_sales_90'] * par_target_cover_days).sum())
+
+    if merged.empty:
+        dead_stock_value = 0.0
+        dead_sku_count = 0
+        dead_sku_details = pd.DataFrame(columns=['SKU Name', 'Stock Value', 'Sales 90D', 'Sales Contribution %', 'Cover Days'])
+    else:
+        if total_sales_90_for_contribution > 0:
+            merged['sales_contribution'] = merged['sales_90'] / total_sales_90_for_contribution
+        else:
+            merged['sales_contribution'] = 0.0
+
+        merged['cover_days_90'] = np.where(
+            (merged['stock_value'] > 0) & (merged['sales_90'] > 0),
+            merged['stock_value'] / (merged['sales_90'] / 90.0),
+            np.where(merged['stock_value'] > 0, np.inf, np.nan)
+        )
+
+        dead_mask = (
+            (merged['stock_value'] > 0)
+            & (merged['sales_contribution'] < 0.02)
+            & (merged['cover_days_90'] > 25)
+        )
+        dead_stock_value = float(merged.loc[dead_mask, 'stock_value'].sum())
+        dead_sku_count = int(merged.loc[dead_mask, 'sku_code'].nunique())
+        dead_sku_details = merged.loc[dead_mask, ['sku_code', 'stock_value', 'sales_90', 'sales_contribution', 'cover_days_90']].copy()
+        dead_sku_details = dead_sku_details.merge(sku_name_map_df[['sku_code', 'sku_name']], on='sku_code', how='left')
+        dead_sku_details['sku_name'] = dead_sku_details['sku_name'].fillna(dead_sku_details['sku_code'])
+        dead_sku_details = dead_sku_details.rename(columns={
+            'sku_name': 'SKU Name',
+            'stock_value': 'Stock Value',
+            'sales_90': 'Sales 90D',
+            'sales_contribution': 'Sales Contribution %',
+            'cover_days_90': 'Cover Days',
+        })
+        if 'sku_code' in dead_sku_details.columns:
+            dead_sku_details = dead_sku_details.drop(columns=['sku_code'])
+        dead_sku_details['Sales Contribution %'] = pd.to_numeric(dead_sku_details['Sales Contribution %'], errors='coerce').fillna(0) * 100.0
+        dead_sku_details['Cover Days'] = pd.to_numeric(dead_sku_details['Cover Days'], errors='coerce')
+        dead_sku_details['Cover Days'] = np.where(np.isinf(dead_sku_details['Cover Days']), np.nan, dead_sku_details['Cover Days'])
+        dead_sku_details = dead_sku_details.sort_values(['Stock Value', 'Cover Days'], ascending=[False, False])
+
+    wastage_rate = (dead_stock_value / total_stock_value * 100.0) if total_stock_value > 0 else 0.0
+
+    inventory_turnover = (sales_90 / avg_stock_90) if avg_stock_90 > 0 else 0.0
+    gmroii = (sales_30 / avg_stock_30) if avg_stock_30 > 0 else 0.0
+    safety_stock_coverage = (total_stock_value / (sales_30 / 30.0)) if sales_30 > 0 else 0.0
+
+    inflow_cycle_days = 0.0
+    if not stock_daily_df.empty:
+        stock_daily_df['Prev_Stock'] = stock_daily_df['Stock_Value'].shift(1)
+        stock_daily_df['Prev_Stock'] = pd.to_numeric(stock_daily_df['Prev_Stock'], errors='coerce').fillna(stock_daily_df['Stock_Value'])
+        stock_daily_df['Inflow'] = (stock_daily_df['Stock_Value'] - stock_daily_df['Prev_Stock']).clip(lower=0)
+        inflow_days = stock_daily_df.loc[stock_daily_df['Inflow'] > 0, 'Report_Date'].dt.normalize().drop_duplicates().sort_values()
+        if len(inflow_days) >= 2:
+            inflow_cycle_days = float(np.diff(inflow_days.values).astype('timedelta64[D]').astype(int).mean())
+
+    return {
+        'current_inventory_value': float(total_stock_value),
+        'par_level_inventory_value': float(par_level_inventory_value),
+        'par_target_cover_days': float(par_target_cover_days),
+        'inventory_turnover': float(inventory_turnover),
+        'dead_stock_value': float(dead_stock_value),
+        'dead_sku_count': int(dead_sku_count),
+        'dead_sku_details': dead_sku_details,
+        'avg_replenishment_cycle': float(inflow_cycle_days),
+        'wastage_rate': float(wastage_rate),
+        'gmroii': float(gmroii),
+        'safety_stock_coverage': float(safety_stock_coverage),
+    }
+
+
 @st.cache_data(ttl=3600)
 def fetch_table_structure_data():
     """Fetch table and column metadata for current database."""
@@ -183,7 +1007,7 @@ WITH ContinuousDeliveries AS (
         COUNT(*) OVER (PARTITION BY o.`Store Code`, m.brand) AS TotalDeliveries,
         CASE WHEN (o.`Delivered Units` / m.`UOM`) < 0.5 THEN 1 ELSE 0 END AS LessThanHalfCtn
     FROM
-        (SELECT * FROM ordervsdelivered WHERE `Delivered Units` > 0) o
+        (SELECT * FROM ordered_vs_delivered_rows WHERE `Delivered Units` > 0) o
     LEFT JOIN
         sku_master m ON m.`Sku_Code` = o.`SKU Code`
     WHERE
@@ -262,7 +1086,7 @@ def fetch_kpi_data(start_date, end_date, town_code):
     query = f"""
     WITH raw AS (
     SELECT
-        u.`Channel Type` AS Channel,
+        Case when u.`Channel Type` is null then "Channel Empty"  else u.`Channel Type` end Channel,
         SUM(o.`Delivered Amount` + o.`Total Discount`) AS Amount,
         o.`Delivery Date` AS D_Date,
 				SUM(o.`Delivered (Litres)`) AS Ltr,
@@ -270,7 +1094,7 @@ def fetch_kpi_data(start_date, end_date, town_code):
 				when o.`Distributor Code`='D70002246' then 'Lahore' else 'CBL' end Town,
 				`Invoice Number` as Orders
     FROM
-        ordervsdelivered o
+        ordered_vs_delivered_rows o
     LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
     WHERE
         1=1
@@ -363,13 +1187,13 @@ def fetch_channel_treemap():
     query = f"""
     SELECT 
         CONCAT(YEAR(`Delivery Date`), '-', LPAD(MONTH(`Delivery Date`), 2, '0')) AS period,
-        u.`Channel Type` AS channel,
+        Case when u.`Channel Type` is null then "Channel Empty"  else u.`Channel Type` end channel,
         SUM(o.`Delivered Amount` + o.`Total Discount`) AS nmv
-    FROM ordervsdelivered o
+    FROM ordered_vs_delivered_rows o
     INNER JOIN universe u ON u.`Store Code` = o.`Store Code`
     WHERE o.`Delivery Date` >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
     AND o.`Delivery Date` IS NOT NULL
-    GROUP BY period, u.`Channel Type`
+    GROUP BY period, channel
     ORDER BY o.`Delivery Date` DESC
     """
     
@@ -383,18 +1207,18 @@ def fetch_Channel_dm_sunburst_data(start, end, town_code):
     
     query = f"""
     SELECT
-    u.`Channel Type` as Channel,
+    Case when u.`Channel Type` is null then "Channel Empty"  else u.`Channel Type` end Channel,
 		s.Brand,
 		o.DM,
 		count(DISTINCT o.`Store Code`) as StoreCount,
         town	
 FROM
 	(SELECT DISTINCT `Deliveryman Name` as DM ,`Store Code`,`SKU Code`,`Delivery Date`,Case when `Distributor Code`='D70002202' then 'Karachi'
-				when `Distributor Code`='D70002246' then 'Lahore' else 'CBL' end Town from ordervsdelivered where `Distributor Code` = '{town_code}') o
+				when `Distributor Code`='D70002246' then 'Lahore' else 'CBL' end Town from ordered_vs_delivered_rows where `Distributor Code` = '{town_code}') o
 	LEFT JOIN sku_master s ON s.Sku_Code = o.`SKU Code` 
 	LEFT JOIN universe u on u.`Store Code`=o.`Store Code`
 	where `Delivery Date` BETWEEN '{start}' AND '{end}'
-	GROUP BY u.`Channel Type`,s.Brand,o.dm,o.town"""
+	GROUP BY Channel,s.Brand,o.dm,o.town"""
     
     return read_sql_cached(query, db_name)
 
@@ -406,7 +1230,7 @@ def Channelwise_performance_data(start, end, town_code):
     query = f"""
     WITH raw AS (
     SELECT
-        u.`Channel Type` AS Channel,
+        Case when u.`Channel Type` is null then "Channel Empty"  else u.`Channel Type` end Channel,
         SUM(o.`Delivered Amount` + o.`Total Discount`) AS Amount,
         o.`Delivery Date` AS D_Date,
 				SUM(o.`Delivered (Litres)`) AS Ltr,
@@ -414,11 +1238,11 @@ def Channelwise_performance_data(start, end, town_code):
 				when o.`Distributor Code`='D70002246' then 'Lahore' else 'CBL' end Town,
 				`Invoice Number` as Orders
     FROM
-        ordervsdelivered o
+        ordered_vs_delivered_rows o
     LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
     where o.`Distributor Code`= '{town_code}'
     GROUP BY
-        u.`Channel Type`,
+        Channel,
         o.`Delivery Date`,o.`Distributor Code`,`Invoice Number`
 )
 
@@ -497,23 +1321,48 @@ ORDER BY
     return read_sql_cached(query, db_name)
 
 @st.cache_data(ttl=3600)
-def Brand_wise_performance_growth_data(start, end, town_code):
+def fetch_brand_growth_channel_options(start, end, town_code):
+    """Fetch available channel options for Brand-wise Growth section."""
+    query = f"""
+    SELECT DISTINCT CASE WHEN u.`Channel Type` IS NULL THEN 'Channel Empty' ELSE u.`Channel Type` END AS Channel
+    FROM ordered_vs_delivered_rows o
+    LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
+    WHERE o.`Distributor Code` = '{town_code}'
+      AND o.`Delivery Date` BETWEEN '{start}' AND '{end}'
+      AND u.`Channel Type` IS NOT NULL
+      AND TRIM(u.`Channel Type`) <> ''
+    ORDER BY Channel
+    """
+    return read_sql_cached(query, "db42280")
+
+
+@st.cache_data(ttl=3600)
+def Brand_wise_performance_growth_data(start, end, town_code, selected_channel='All'):
     """Fetch brand-wise performance data for comparison charts"""
     db_name = "db42280"
+
+    channel_condition = ""
+    if selected_channel and selected_channel != 'All':
+        selected_channel_safe = str(selected_channel).replace("'", "''")
+        channel_condition = f"AND u.`Channel Type` = '{selected_channel_safe}'"
     
     query = f"""
  WITH raw AS (
     SELECT
+                CASE WHEN u.`Channel Type` IS NULL OR TRIM(u.`Channel Type`) = '' THEN 'Channel Empty' ELSE u.`Channel Type` END AS Channel,
         s.brand AS Brand,
         SUM(o.`Delivered Amount` + o.`Total Discount`) AS Amount,
         o.`Delivery Date` AS D_Date,
 				case when SUM(o.`Delivered (Litres)`)=0 then SUM(o.`Delivered (Kg)`) else SUM(o.`Delivered (Litres)`) END Ltr,
 				Case when o.`Distributor Code`='D70002202' then 'Karachi' else 'Lahore' end Town
     FROM
-        ordervsdelivered o
+        ordered_vs_delivered_rows o
     LEFT JOIN sku_master s ON s.sku_code= o.`sku code`
+    left join universe u on u.`Store Code`=o.`Store Code`
     where o.`Distributor Code`= '{town_code}'
+    {channel_condition}
     GROUP BY
+        Channel,
         s.brand,
         o.`Delivery Date`,o.`Distributor Code`
 )
@@ -521,6 +1370,7 @@ def Brand_wise_performance_growth_data(start, end, town_code):
 , selected_period AS (
     SELECT
 		Town,
+                raw.Channel,
         raw.brand,
         SUM(raw.Amount) AS NMV,
 				SUM(ltr) as Ltr
@@ -529,12 +1379,14 @@ def Brand_wise_performance_growth_data(start, end, town_code):
     WHERE
         raw.D_Date BETWEEN '{start}' AND '{end}'
     GROUP BY
+                raw.Channel,
         raw.brand,
 				Town
 )
 , last_year_period AS (
     SELECT
 		town,
+                raw.Channel,
         raw.brand,
         SUM(raw.Amount) AS NMV,
 				sum(ltr) as Ltr
@@ -543,11 +1395,12 @@ def Brand_wise_performance_growth_data(start, end, town_code):
     WHERE
         raw.D_Date BETWEEN DATE_SUB('{start}', INTERVAL 1 YEAR) AND DATE_SUB('{end}', INTERVAL 1 YEAR)
     GROUP BY
-        raw.brand,town
+                raw.Channel,raw.brand,town
 ),
 last_month AS (
     SELECT
 		town,
+                raw.Channel,
         raw.brand,
         SUM(raw.Amount) AS NMV,
 				sum(ltr) as Ltr
@@ -556,11 +1409,12 @@ last_month AS (
     WHERE
         raw.D_Date BETWEEN DATE_SUB('{start}', INTERVAL 1 month) AND DATE_SUB('{end}', INTERVAL 1 month)
     GROUP BY
-        raw.brand,town
+                raw.Channel,raw.brand,town
 )
 
 SELECT
 		sp.town,
+        sp.Channel,
     sp.brand,
     sp.NMV AS Current_Period_Sales,
     ly.NMV AS Last_Year_Sales,
@@ -575,9 +1429,9 @@ SELECT
 FROM
     selected_period sp
 LEFT JOIN
-    last_year_period ly ON sp.brand = ly.brand
+    last_year_period ly ON sp.brand = ly.brand AND sp.Channel = ly.Channel AND sp.town = ly.town
 LEFT JOIN
-    last_month lm ON sp.brand = lm.brand
+    last_month lm ON sp.brand = lm.brand AND sp.Channel = lm.Channel AND sp.town = lm.town
 
 		
 ORDER BY
@@ -602,7 +1456,7 @@ def dm_wise_performance_growth_data(start, end, town_code):
                 Case when o.`Distributor Code`='D70002202' then 'Karachi'
 				when o.`Distributor Code`='D70002246' then 'Lahore' else 'CBL' end Town
     FROM
-        ordervsdelivered o
+        ordered_vs_delivered_rows o
     LEFT JOIN sku_master s ON s.sku_code= o.`sku code`
     where o.`Distributor Code`= '{town_code}'
     GROUP BY
@@ -696,12 +1550,12 @@ Case when o.`Distributor Code`='D70002202' then 'Karachi'
 
 
 
- from ordervsdelivered o
+ from ordered_vs_delivered_rows o
  LEFT JOIN (SELECT month,year,sum(Target_In_Value) as Target_In_Value,sum(Target_In_Volume) as Target_In_Volume,Distributor_Code  from targets group by year,month,Distributor_Code) t on t.month= month(o.`Delivery Date`) and t.year=YEAR(o.`Delivery Date`) and t.Distributor_Code = o.`Distributor Code`
 where o.`Distributor Code` = '{town_code}'
  GROUP BY MONTH(`Delivery Date`),YEAR(`Delivery Date`),Town
 order by YEAR(`Delivery Date`) desc,MONTH(`Delivery Date`) desc
- limit 8
+ limit 14
 
 
 """
@@ -728,7 +1582,7 @@ Case when o.`Distributor Code`='D70002202' then 'Karachi'
 
 
 
- from ordervsdelivered o
+ from ordered_vs_delivered_rows o
  LEFT JOIN (SELECT month,year,sum(Target_In_Value) as Target_In_Value,sum(Target_In_Volume) as Target_In_Volume,Distributor_Code,Order_Booker_Code  from targets group by year,month,Distributor_Code,Order_Booker_Code) t on t.month= month(o.`Delivery Date`) and t.year=YEAR(o.`Delivery Date`) and t.Distributor_Code = o.`Distributor Code` and t.Order_Booker_Code=o.`Order Booker Code`
 where o.`Distributor Code` = '{town_code}'
  GROUP BY MONTH(`Delivery Date`),YEAR(`Delivery Date`),Town,o.`Order Booker Name`
@@ -745,11 +1599,11 @@ def tgtvsach_channelwise_heatmap(town_code):
     query = f"""
     SELECT
     CONCAT(YEAR(`Delivery Date`), '-', LPAD(MONTH(`Delivery Date`), 2, '0')) AS period,
-    u.`Channel Type` AS Channel,
+    CASE WHEN u.`Channel Type` IS NULL THEN "Channel Empty" ELSE u.`Channel Type` END Channel,
     ROUND(SUM(`Delivered Amount` + `Total Discount`)) AS NMV,
     ROUND(SUM(`Delivered (Litres)` + `Delivered (KG)`)) AS Ltr
 FROM 
-    ordervsdelivered o
+    ordered_vs_delivered_rows o
 INNER JOIN 
     universe u ON u.`Store Code` = o.`Store Code`
 WHERE 
@@ -757,9 +1611,9 @@ WHERE
     AND (YEAR(`Delivery Date`) < YEAR(CURDATE()) OR (YEAR(`Delivery Date`) = YEAR(CURDATE()) AND MONTH(`Delivery Date`) < MONTH(CURDATE())))  -- Exclude current month
     AND o.`Distributor Code` = '{town_code}'
     GROUP BY 
-    period, u.`Channel Type`
+    period, Channel
 ORDER BY 
-    period, u.`Channel Type`
+    period, Channel
     """
     return read_sql_cached(query, db_name)
 
@@ -786,7 +1640,7 @@ def tgtvsach_brand_level(town_code, selected_period, selected_channel='All'):
                 WHEN o.`Distributor Code`='D70002246' THEN 'Lahore'
                 ELSE 'CBL'
             END AS Town
-        FROM ordervsdelivered o
+        FROM ordered_vs_delivered_rows o
         LEFT JOIN sku_master s ON s.Sku_Code = o.`SKU Code`
         LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
         WHERE o.`Distributor Code` = '{town_code}'
@@ -847,15 +1701,15 @@ def tgtvsach_brand_level(town_code, selected_period, selected_channel='All'):
 def fetch_treemap_channel_options(town_code, selected_period):
         """Fetch available channel options for selected treemap period."""
         query = f"""
-        SELECT DISTINCT u.`Channel Type` AS Channel
-        FROM ordervsdelivered o
+        SELECT DISTINCT CASE WHEN u.`Channel Type` IS NULL THEN "Channel Empty" ELSE u.`Channel Type` END Channel
+        FROM ordered_vs_delivered_rows o
         LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
         WHERE o.`Distributor Code` = '{town_code}'
             AND o.`Delivery Date` BETWEEN STR_TO_DATE(CONCAT('{selected_period}', '-01'), '%%Y-%%m-%%d')
                                                             AND LAST_DAY(STR_TO_DATE(CONCAT('{selected_period}', '-01'), '%%Y-%%m-%%d'))
             AND u.`Channel Type` IS NOT NULL
             AND TRIM(u.`Channel Type`) <> ''
-        ORDER BY u.`Channel Type`
+        ORDER BY Channel
         """
         return read_sql_cached(query, "db42280")
 
@@ -875,7 +1729,7 @@ def AOV_MOPU_data(town_code, months_back):
     query = f"""
     WITH last_6_months AS (
     SELECT *,`Delivered Units`/UOM as Del_Ctn
-    FROM ordervsdelivered
+    FROM ordered_vs_delivered_rows
 		left join sku_master m on m.Sku_Code= `SKU Code`
     WHERE `Order Date` >= DATE_SUB(CURDATE(), INTERVAL {months_back} MONTH)
 		and `Distributor Code`='{town_code}'
@@ -912,7 +1766,7 @@ def ON_Wise_Visit_freq_data(town_code):
     COUNT(*) AS Total_Visits,
     SUM(CASE WHEN `Visit Complete` = 'Yes' THEN 1 ELSE 0 END) AS Completed_Visits,
     SUM(CASE WHEN `Non Productive` = 'Yes' THEN 1 ELSE 0 END) AS Non_Productive_Visits
-FROM visits
+FROM visits_summary_rows
 WHERE `Visit Date` >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
 and TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(`Distributor`, '[', -1),']',1)) = '{town_code}'
 GROUP BY VisitMonth, OB_Name
@@ -926,10 +1780,10 @@ def GMV_OB_calendar_heatmap_data(town_code, start, end):
     SELECT
         o.`Order Date` AS Order_Date,
         o.`Order Booker Name`,
-        u.`Channel Type` AS Channel,
+        CASE WHEN u.`Channel Type` IS NULL THEN "Channel Empty" ELSE u.`Channel Type` END Channel,
         ROUND(SUM(o.`Order Amount`), 0) AS GMV,
         COUNT(DISTINCT o.`Order Number`) AS Orders
-    FROM ordervsdelivered o
+    FROM ordered_vs_delivered_rows o
     LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
     WHERE o.`Distributor Code`='{town_code}'
       AND o.`Order Date` BETWEEN '{start}' AND '{end}'
@@ -944,7 +1798,7 @@ def fetch_booker_fieldforce_deep_data(start_date, end_date, town_code):
     SELECT
         o.`Order Booker Name` AS Booker,
         o.`Deliveryman Name` AS Deliveryman,
-        u.`Channel Type` AS Channel,
+                Case when u.`Channel Type` is null then "Channel Empty"  else u.`Channel Type` end Channel,
         ROUND(SUM(o.`Delivered Amount` + o.`Total Discount`), 0) AS NMV,
         COUNT(DISTINCT o.`Invoice Number`) AS Orders,
         COUNT(DISTINCT o.`Store Code`) AS Stores,
@@ -954,7 +1808,7 @@ def fetch_booker_fieldforce_deep_data(start_date, end_date, town_code):
             0
         ) AS AOV,
         ROUND(SUM(o.`Delivered (Litres)` + o.`Delivered (KG)`), 0) AS Volume
-    FROM ordervsdelivered o
+    FROM ordered_vs_delivered_rows o
     LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
     WHERE o.`Distributor Code` = '{town_code}'
       AND o.`Delivery Date` BETWEEN '{start_date}' AND '{end_date}'
@@ -979,7 +1833,7 @@ def fetch_routewise_ob_achievement(start_date, end_date, town_code, selected_cha
             o.`Order Booker Name` AS Booker,
             s.Brand AS Brand,
             ROUND(SUM(o.`Delivered Amount` + o.`Total Discount`), 0) AS Achieved_Value
-        FROM ordervsdelivered o
+        FROM ordered_vs_delivered_rows o
         LEFT JOIN sku_master s ON s.Sku_Code = o.`SKU Code`
         LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
         WHERE o.`Distributor Code` = '{town_code}'
@@ -1038,12 +1892,12 @@ def fetch_daily_calls_trend_data(start_date, end_date, town_code):
         SUM(
             CASE
                 WHEN v.`Visit Complete` = 'Yes'
-                     AND COALESCE(v.`Non Productive`, 'No') <> 'Yes'
+                     AND COALESCE(v.`Non Productive w.r.t Order`, 'No') <> 'Yes'
                 THEN 1
                 ELSE 0
             END
         ) AS Productive_Calls
-    FROM visits v
+    FROM visits_summary_rows v
     WHERE v.`Visit Date` BETWEEN '{start_date}' AND '{end_date}'
       AND v.`Visit Date` <> '0000-00-00'
       AND TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(v.`Distributor`, '[', -1),']',1)) = '{town_code}'
@@ -1069,7 +1923,7 @@ def fetch_booker_leaderboard_data(start_date, end_date, town_code, selected_chan
             ROUND(SUM(o.`Delivered Amount` + o.`Total Discount`), 0) AS Revenue,
             COUNT(DISTINCT o.`Invoice Number`) AS Orders,
             COUNT(DISTINCT o.`Store Code`) AS Active_Outlets
-        FROM ordervsdelivered o
+        FROM ordered_vs_delivered_rows o
         LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
         WHERE o.`Distributor Code` = '{town_code}'
           AND o.`Delivery Date` BETWEEN '{start_date}' AND '{end_date}'
@@ -1080,13 +1934,13 @@ def fetch_booker_leaderboard_data(start_date, end_date, town_code, selected_chan
         SELECT
             o.`Order Booker Code` AS Booker_Code,
             o.`Order Booker Name` AS Booker,
-            u.`Channel Type` AS Region,
+                    Case when u.`Channel Type` is null then "Channel Empty"  else u.`Channel Type` end  Region,
             COUNT(*) AS Channel_Orders,
             ROW_NUMBER() OVER (
                 PARTITION BY o.`Order Booker Code`
                 ORDER BY COUNT(*) DESC
             ) AS rn
-        FROM ordervsdelivered o
+        FROM ordered_vs_delivered_rows o
         LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
         WHERE o.`Distributor Code` = '{town_code}'
           AND o.`Delivery Date` BETWEEN '{start_date}' AND '{end_date}'
@@ -1099,7 +1953,7 @@ def fetch_booker_leaderboard_data(start_date, end_date, town_code, selected_chan
             COUNT(*) AS Planned_Calls,
             SUM(CASE WHEN v.`Visit Complete` = 'Yes' THEN 1 ELSE 0 END) AS Executed_Calls,
             COUNT(DISTINCT v.`Visit Date`) AS Call_Days
-        FROM visits v
+        FROM visits_summary_rows v
         WHERE v.`Visit Date` BETWEEN '{start_date}' AND '{end_date}'
           AND v.`Visit Date` <> '0000-00-00'
           AND TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(v.`Distributor`, '[', -1),']',1)) = '{town_code}'
@@ -1110,7 +1964,7 @@ def fetch_booker_leaderboard_data(start_date, end_date, town_code, selected_chan
             o.`Order Booker Code` AS Booker_Code,
             o.`Store Code` AS Store_Code,
             MIN(o.`Delivery Date`) AS First_Date
-        FROM ordervsdelivered o
+        FROM ordered_vs_delivered_rows o
         LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
         WHERE o.`Distributor Code` = '{town_code}'
           {channel_condition_sales}
@@ -1123,14 +1977,49 @@ def fetch_booker_leaderboard_data(start_date, end_date, town_code, selected_chan
         FROM first_outlet f
         WHERE f.First_Date BETWEEN '{start_date}' AND '{end_date}'
         GROUP BY f.Booker_Code
+    ),
+    sku_bill AS (
+        SELECT
+            o.`Order Booker Code` AS Booker_Code,
+            ROUND(
+                COUNT(DISTINCT CONCAT(o.`Invoice Number`, '||', o.`SKU Code`))
+                / NULLIF(COUNT(DISTINCT o.`Invoice Number`), 0),
+                2
+            ) AS SKU_Per_Bill
+        FROM ordered_vs_delivered_rows o
+        LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
+        WHERE o.`Distributor Code` = '{town_code}'
+          AND o.`Delivery Date` BETWEEN '{start_date}' AND '{end_date}'
+          {channel_condition_sales}
+        GROUP BY o.`Order Booker Code`
+    ),
+    target_agg AS (
+        SELECT
+            t.`AppUser Code` AS Booker_Code,
+            ROUND(SUM(COALESCE(t.Target, 0)), 0) AS Target_Value
+        FROM targets_new t
+        WHERE t.Distributor_Code = '{town_code}'
+          AND t.KPI = 'Value'
+          AND STR_TO_DATE(CONCAT(t.year, '-', LPAD(t.month, 2, '0'), '-01'), '%%Y-%%m-%%d')
+              BETWEEN DATE_FORMAT('{start_date}', '%%Y-%%m-01') AND DATE_FORMAT('{end_date}', '%%Y-%%m-01')
+        GROUP BY t.`AppUser Code`
     )
     SELECT
         s.Booker,
         COALESCE(cr.Region, 'Unknown') AS Region,
+        COALESCE(t.Target_Value, 0) AS Target_Value,
         s.Revenue,
         s.Orders,
         s.Active_Outlets,
         ROUND(s.Revenue / NULLIF(s.Orders, 0), 0) AS Avg_Order_Val,
+        COALESCE(sb.SKU_Per_Bill, 0) AS SKU_Per_Bill,
+        ROUND(
+            CASE
+                WHEN COALESCE(t.Target_Value, 0) > 0 THEN (s.Revenue / t.Target_Value) * 100
+                ELSE 0
+            END,
+            1
+        ) AS Achievement_Pct,
         COALESCE(c.Planned_Calls, 0) AS Planned_Calls,
         COALESCE(c.Executed_Calls, 0) AS Executed_Calls,
         COALESCE(c.Call_Days, 0) AS Call_Days,
@@ -1143,6 +2032,8 @@ def fetch_booker_leaderboard_data(start_date, end_date, town_code, selected_chan
     ) cr ON cr.Booker_Code = s.Booker_Code
     LEFT JOIN calls c ON c.Booker = s.Booker
     LEFT JOIN new_outlets n ON n.Booker_Code = s.Booker_Code
+    LEFT JOIN sku_bill sb ON sb.Booker_Code = s.Booker_Code
+    LEFT JOIN target_agg t ON t.Booker_Code = s.Booker_Code
     ORDER BY s.Revenue DESC
     """
     return read_sql_cached(query, "db42280")
@@ -1165,7 +2056,7 @@ def fetch_activity_segmentation_data(start_date, end_date, town_code, selected_c
     query = f"""
     WITH scoped_stores AS (
         SELECT DISTINCT o.`Store Code` AS Store_Code
-        FROM ordervsdelivered o
+        FROM ordered_vs_delivered_rows o
         LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
         WHERE o.`Distributor Code` = '{town_code}'
         AND u.status='Active'
@@ -1176,7 +2067,7 @@ def fetch_activity_segmentation_data(start_date, end_date, town_code, selected_c
         SELECT
             o.`Store Code` AS Store_Code,
             COUNT(DISTINCT o.`Invoice Number`) AS Orders_In_Period
-        FROM ordervsdelivered o
+        FROM ordered_vs_delivered_rows o
         LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
         WHERE o.`Distributor Code` = '{town_code}'
           AND o.`Delivery Date` BETWEEN '{start_date}' AND '{end_date}'
@@ -1214,7 +2105,7 @@ def fetch_activity_segmentation_booker_data(start_date, end_date, town_code, sel
             o.`Store Code` AS Store_Code,
             MAX(o.`Store Name`) AS Store_Name,
             MAX(o.`Delivery Date`) AS Last_Order_Date
-        FROM ordervsdelivered o
+        FROM ordered_vs_delivered_rows o
         LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
         WHERE o.`Distributor Code` = '{town_code}'
         AND u.status='Active'
@@ -1227,7 +2118,7 @@ def fetch_activity_segmentation_booker_data(start_date, end_date, town_code, sel
             o.`Order Booker Name` AS Booker,
             o.`Store Code` AS Store_Code,
             COUNT(DISTINCT o.`Invoice Number`) AS Orders_In_Period
-        FROM ordervsdelivered o
+        FROM ordered_vs_delivered_rows o
         LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
         WHERE o.`Distributor Code` = '{town_code}'
           AND o.`Delivery Date` BETWEEN '{start_date}' AND '{end_date}'
@@ -1267,7 +2158,7 @@ def fetch_weekly_cohort_orders(start_date, end_date, town_code, selected_channel
     SELECT
         o.`Store Code` AS Store_Code,
         DATE(o.`Delivery Date`) AS Order_Date
-    FROM ordervsdelivered o
+    FROM ordered_vs_delivered_rows o
     LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
     WHERE o.`Distributor Code` = '{town_code}'
       AND o.`Delivery Date` BETWEEN '{start_date}' AND '{end_date}'
@@ -1302,7 +2193,7 @@ def fetch_sku_per_bill_metric(start_date, end_date, town_code, selected_channels
             / NULLIF(COUNT(DISTINCT o.`Invoice Number`), 0),
             2
         ) AS SKU_Per_Bill
-    FROM ordervsdelivered o
+    FROM ordered_vs_delivered_rows o
     LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
     WHERE o.`Distributor Code` = '{town_code}'
       AND o.`Delivery Date` BETWEEN '{start_date}' AND '{end_date}'
@@ -1332,7 +2223,7 @@ def fetch_booker_brand_scoring_data(start_date, end_date, town_code, selected_ch
         COALESCE(s.Brand, 'Unknown') AS Brand,
         ROUND(SUM(o.`Delivered Amount` + o.`Total Discount`), 0) AS NMV,
         COUNT(DISTINCT o.`Invoice Number`) AS Orders
-    FROM ordervsdelivered o
+    FROM ordered_vs_delivered_rows o
     LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
     LEFT JOIN sku_master s ON s.Sku_Code = o.`SKU Code`
     WHERE o.`Distributor Code` = '{town_code}'
@@ -1350,7 +2241,7 @@ def fetch_latest_visit_date(town_code):
         """Fetch latest valid visit date for selected distributor."""
         query = f"""
         SELECT MAX(v.`Visit Date`) AS Latest_Visit_Date
-        FROM visits v
+        FROM visits_summary_rows v
         WHERE v.`Visit Date` <> '0000-00-00'
             AND TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(v.`Distributor`, '[', -1),']',1)) = '{town_code}'
         """
@@ -1470,6 +2361,11 @@ def create_Channel_performance_chart(df, metric_type='Value'):
     for col in [current_col, last_year_col, last_month_col]:
         df_processed[col] = df_processed[col] / divisor
     
+    df_processed[last_year_col] = pd.to_numeric(df_processed[last_year_col],errors="coerce")
+    df_processed[last_month_col] = pd.to_numeric(df_processed[last_month_col],errors="coerce")
+    df_processed[growth_ly_col] = pd.to_numeric(df_processed[growth_ly_col],errors="coerce")
+    df_processed[growth_lm_col] = pd.to_numeric(df_processed[growth_lm_col],errors="coerce")
+
     # Format values for display
     if metric_type == 'Value':
         current_vals = df_processed[current_col].round(1)
@@ -1656,7 +2552,7 @@ def create_channel_wise_growth_chart(df, metric_type='Value'):
     return apply_theme_aware_bar_labels(fig)
 
 def create_brand_wise_growth_chart(df, metric_type='Value'):
-    """Create brand-wise growth percentage chart with value/ltr hover details."""
+    """Create brand-wise growth percentage bar chart with value/ltr hover details."""
     if df is None or df.empty:
         fig = go.Figure()
         fig.add_annotation(
@@ -1686,43 +2582,83 @@ def create_brand_wise_growth_chart(df, metric_type='Value'):
         unit_label = 'T'
         metric_label = 'Litres'
 
-    df_processed = df[[
-        'brand', current_col, last_year_col, last_month_col,
-        growth_ly_col, growth_lm_col
-    ]].copy()
+    required_cols = ['brand', current_col, last_year_col, last_month_col]
+    missing_cols = [column for column in required_cols if column not in df.columns]
+    if missing_cols:
+        fig = go.Figure()
+        fig.add_annotation(
+            text=f"Missing columns for chart: {', '.join(missing_cols)}",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="gray")
+        )
+        return fig
 
-    numeric_cols = [current_col, last_year_col, last_month_col, growth_ly_col, growth_lm_col]
+    def _ellipsis_label(text, max_len=14):
+        text = str(text or '')
+        return text if len(text) <= max_len else text[:max_len] + '...'
+
+    df_processed = df[required_cols].copy()
+    numeric_cols = [current_col, last_year_col, last_month_col]
     for column in numeric_cols:
         df_processed[column] = pd.to_numeric(df_processed[column], errors='coerce').fillna(0)
 
+    df_processed['brand'] = df_processed['brand'].fillna('Unknown Brand').astype(str)
+    df_processed = (
+        df_processed
+        .groupby('brand', as_index=False)
+        .agg(
+            **{
+                current_col: (current_col, 'sum'),
+                last_year_col: (last_year_col, 'sum'),
+                last_month_col: (last_month_col, 'sum'),
+            }
+        )
+    )
+
+    df_processed[growth_ly_col] = np.where(
+        pd.to_numeric(df_processed[last_year_col], errors='coerce').fillna(0) > 0,
+        ((pd.to_numeric(df_processed[current_col], errors='coerce').fillna(0)
+          / pd.to_numeric(df_processed[last_year_col], errors='coerce').fillna(0)) - 1) * 100,
+        0,
+    )
+    df_processed[growth_lm_col] = np.where(
+        pd.to_numeric(df_processed[last_month_col], errors='coerce').fillna(0) > 0,
+        ((pd.to_numeric(df_processed[current_col], errors='coerce').fillna(0)
+          / pd.to_numeric(df_processed[last_month_col], errors='coerce').fillna(0)) - 1) * 100,
+        0,
+    )
+
+    df_processed[growth_ly_col] = pd.to_numeric(df_processed[growth_ly_col], errors='coerce').fillna(0).round(1)
+    df_processed[growth_lm_col] = pd.to_numeric(df_processed[growth_lm_col], errors='coerce').fillna(0).round(1)
+
+    df_processed['brand_short'] = df_processed['brand'].apply(lambda value: _ellipsis_label(value, 14))
     df_processed[current_col] = df_processed[current_col] / divisor
     df_processed[last_year_col] = df_processed[last_year_col] / divisor
     df_processed[last_month_col] = df_processed[last_month_col] / divisor
 
-    current_vals = df_processed[current_col].round(2)
-    last_year_vals = df_processed[last_year_col].round(2)
-    last_month_vals = df_processed[last_month_col].round(2)
-
     customdata = np.column_stack([
-        current_vals,
-        last_year_vals,
-        last_month_vals,
+        df_processed[current_col].round(2),
+        df_processed[last_year_col].round(2),
+        df_processed[last_month_col].round(2),
+        df_processed['brand'].astype(str),
     ])
 
     ly_colors = ['#B8B8D1' if value >= 0 else '#FF6B6C' for value in df_processed[growth_ly_col]]
     lm_colors = ['#FFC145' if value >= 0 else '#FF6B6C' for value in df_processed[growth_lm_col]]
+
     fig = go.Figure()
     fig.add_trace(
         go.Bar(
-            x=df_processed['brand'],
+            x=df_processed['brand_short'],
             y=df_processed[growth_ly_col],
             name='Growth vs Last Year',
             marker=dict(color=ly_colors),
-            text=df_processed[growth_ly_col].apply(lambda x: f"{x:.1f}%"),
+            text=df_processed[growth_ly_col].apply(lambda value: f"{value:.1f}%"),
             textposition='outside',
             customdata=customdata,
             hovertemplate=(
-                '<b>%{x}</b>'
+                '<b>%{customdata[3]}</b>'
                 '<br>Growth vs Last Year: %{y:.1f}%'
                 '<br>Current ' + metric_label + ': %{customdata[0]:.2f}' + unit_label +
                 '<br>Last Year ' + metric_label + ': %{customdata[1]:.2f}' + unit_label +
@@ -1733,15 +2669,15 @@ def create_brand_wise_growth_chart(df, metric_type='Value'):
     )
     fig.add_trace(
         go.Bar(
-            x=df_processed['brand'],
+            x=df_processed['brand_short'],
             y=df_processed[growth_lm_col],
             name='Growth vs Last Month',
             marker=dict(color=lm_colors),
-            text=df_processed[growth_lm_col].apply(lambda x: f"{x:.1f}%"),
+            text=df_processed[growth_lm_col].apply(lambda value: f"{value:.1f}%"),
             textposition='outside',
             customdata=customdata,
             hovertemplate=(
-                '<b>%{x}</b>'
+                '<b>%{customdata[3]}</b>'
                 '<br>Growth vs Last Month: %{y:.1f}%'
                 '<br>Current ' + metric_label + ': %{customdata[0]:.2f}' + unit_label +
                 '<br>Last Year ' + metric_label + ': %{customdata[1]:.2f}' + unit_label +
@@ -1750,18 +2686,209 @@ def create_brand_wise_growth_chart(df, metric_type='Value'):
             )
         )
     )
+
     fig.update_layout(
         title=f"📈 Brand-wise Growth Percentage - {metric_type}",
         yaxis=dict(title='Growth %'),
         xaxis=dict(title='Brand'),
-        # height=600,
         barmode='group',
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
         font=dict(size=12, weight='bold'),
-        legend=dict( orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
     )
     return apply_theme_aware_bar_labels(fig)
+
+
+def create_brand_wise_growth_segmented_chart(df, metric_type='Value'):
+    """Create channel-brand segmented sunburst chart for growth/degrowth."""
+    if df is None or df.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No data available",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16, color="gray")
+        )
+        return fig
+
+    if metric_type == 'Value':
+        current_col = 'Current_Period_Sales'
+        last_year_col = 'Last_Year_Sales'
+        last_month_col = 'Last_Month_Sales'
+        growth_ly_col = 'Sales_Growth_LY'
+        growth_lm_col = 'Sales_Growth_LM'
+        divisor = 1_000_000
+        unit_label = 'M'
+        metric_label = 'Sales'
+    else:
+        current_col = 'Current_Period_Ltr'
+        last_year_col = 'Last_Year_Ltr'
+        last_month_col = 'Last_Month_Ltr'
+        growth_ly_col = 'Ltr_Growth_LY'
+        growth_lm_col = 'Ltr_Growth_LM'
+        divisor = 1000
+        unit_label = 'T'
+        metric_label = 'Litres'
+
+    growth_basis = st.session_state.get('brand_growth_basis_filter', 'Last Year')
+    growth_col = growth_ly_col if growth_basis == 'Last Year' else growth_lm_col
+    basis_label = 'Last Year' if growth_basis == 'Last Year' else 'Last Month'
+
+    required_cols = ['Channel', 'brand', current_col, last_year_col, last_month_col, growth_col]
+    missing_cols = [column for column in required_cols if column not in df.columns]
+    if missing_cols:
+        fig = go.Figure()
+        fig.add_annotation(
+            text=f"Missing columns for chart: {', '.join(missing_cols)}",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="gray")
+        )
+        return fig
+
+    def _ellipsis_label(text, max_len=14):
+        text = str(text or '')
+        return text if len(text) <= max_len else text[:max_len] + '...'
+
+    df_processed = df[required_cols].copy()
+
+    numeric_cols = [current_col, last_year_col, last_month_col, growth_col]
+    for column in numeric_cols:
+        df_processed[column] = pd.to_numeric(df_processed[column], errors='coerce').fillna(0)
+
+    df_processed['Channel'] = df_processed['Channel'].fillna('Channel Empty').astype(str)
+    df_processed['brand'] = df_processed['brand'].fillna('Unknown Brand').astype(str)
+
+    df_processed['SegmentSize'] = df_processed[growth_col].abs().clip(lower=0)
+    if df_processed['SegmentSize'].sum() <= 0:
+        df_processed['SegmentSize'] = (df_processed[current_col].abs() / divisor).clip(lower=0)
+
+    if df_processed['SegmentSize'].sum() <= 0:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No growth values available for selected filters",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16, color="gray")
+        )
+        return fig
+
+    channel_summary = (
+        df_processed
+        .groupby('Channel', as_index=False)
+        .agg(
+            SegmentSize=('SegmentSize', 'sum'),
+            Growth_Value=(growth_col, 'mean'),
+            Current=(current_col, 'sum'),
+            Last_Year=(last_year_col, 'sum'),
+            Last_Month=(last_month_col, 'sum')
+        )
+    )
+
+    def _growth_band(value):
+        value = float(value)
+        if value <= -30:
+            return '<= -30%', '#FF6B6C'
+        if value <= -20:
+            return '-30% to -20%', '#F98080'
+        if value <= -10:
+            return '-20% to -10%', '#F8A3A3'
+        if value < 0:
+            return '-10% to 0%', '#FBCACA'
+        if value == 0:
+            return '0%', '#94A3B8'
+        if value <= 10:
+            return '0% to 10%', '#FFE7A3'
+        if value <= 20:
+            return '10% to 20%', '#FFD86B'
+        if value <= 30:
+            return '20% to 30%', '#FFC145'
+        if value <= 50:
+            return '30% to 50%', '#A7E3A2'
+        if value <= 70:
+            return '50% to 70%', '#6CCD7A'
+        return '> 70%', '#16A34A'
+
+    labels = []
+    ids = []
+    parents = []
+    values = []
+    colors = []
+    hover_text = []
+    text_values = []
+
+    for _, row in channel_summary.iterrows():
+        channel_name = str(row['Channel'])
+        channel_label = _ellipsis_label(channel_name, 14)
+        channel_id = f"channel::{channel_name}"
+        labels.append(channel_label)
+        ids.append(channel_id)
+        parents.append("")
+        values.append(float(row['SegmentSize']) if pd.notna(row['SegmentSize']) else 0.0)
+        channel_growth = float(row['Growth_Value']) if pd.notna(row['Growth_Value']) else 0.0
+        channel_band_label, channel_color = _growth_band(channel_growth)
+        colors.append(channel_color)
+        text_values.append(f"{channel_growth:.1f}%")
+        hover_text.append(
+            f"<b>{channel_name}</b><br>{basis_label} Growth (avg): {channel_growth:.1f}%"
+            f"<br>Band: {channel_band_label}"
+            f"<br>Current {metric_label}: {float(row['Current'])/divisor:.2f}{unit_label}"
+            f"<br>Last Year {metric_label}: {float(row['Last_Year'])/divisor:.2f}{unit_label}"
+            f"<br>Last Month {metric_label}: {float(row['Last_Month'])/divisor:.2f}{unit_label}<extra></extra>"
+        )
+
+    for _, row in df_processed.iterrows():
+        channel_name = str(row['Channel'])
+        brand_name = str(row['brand'])
+        brand_label = _ellipsis_label(brand_name, 14)
+        channel_id = f"channel::{channel_name}"
+        brand_id = f"brand::{channel_name}::{brand_name}"
+
+        labels.append(brand_label)
+        ids.append(brand_id)
+        parents.append(channel_id)
+        values.append(float(row['SegmentSize']) if pd.notna(row['SegmentSize']) else 0.0)
+        brand_growth = float(row[growth_col]) if pd.notna(row[growth_col]) else 0.0
+        brand_band_label, brand_color = _growth_band(brand_growth)
+        colors.append(brand_color)
+        text_values.append(f"{brand_growth:.1f}%")
+        hover_text.append(
+            f"<b>{brand_name}</b><br>Channel: {channel_name}<br>{basis_label} Growth: {brand_growth:.1f}%"
+            f"<br>Band: {brand_band_label}"
+            f"<br>Current {metric_label}: {float(row[current_col])/divisor:.2f}{unit_label}"
+            f"<br>Last Year {metric_label}: {float(row[last_year_col])/divisor:.2f}{unit_label}"
+            f"<br>Last Month {metric_label}: {float(row[last_month_col])/divisor:.2f}{unit_label}<extra></extra>"
+        )
+
+    fig = go.Figure(
+        go.Sunburst(
+            labels=labels,
+            ids=ids,
+            parents=parents,
+            values=values,
+            branchvalues='total',
+            marker=dict(
+                colors=colors,
+                line=dict(color='rgba(255,255,255,0.35)', width=1),
+            ),
+            hovertemplate='%{customdata}',
+            customdata=hover_text,
+            text=text_values,
+            insidetextorientation='radial',
+            textinfo='label+text',
+            maxdepth=2,
+        )
+    )
+
+    fig.update_layout(
+        title=f"📈 Brand-wise Growth by Channel (Segmented) - {metric_type} | Basis: {basis_label}",
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(size=12, weight='bold'),
+        margin=dict(t=70, l=10, r=10, b=10)
+    )
+    return fig
 
 def create_dm_wise_growth_chart(df, metric_type='Value'):
     """Create DM-wise growth percentage chart with value/ltr hover details."""
@@ -2703,29 +3830,33 @@ def create_daily_calls_trend_chart(df, selected_bookers=None, title_suffix=""):
 
     fig = go.Figure()
     fig.add_trace(
-        go.Bar(
-            x=trend_df['Call_Date'],
-            y=trend_df['Planned_Calls'],
-            name='Planned Calls',
-            marker_color='#5B5F97',
-            hovertemplate='<b>%{x|%d-%b-%Y}</b><br>Planned Calls: %{y:,.0f}<extra></extra>'
-        )
-    )
-    fig.add_trace(
-        go.Bar(
+        go.Scatter(
             x=trend_df['Call_Date'],
             y=trend_df['Executed_Calls'],
             name='Executed Calls',
-            marker_color='#FFC145',
+            mode='lines',
+            line=dict(color='#FFC145', width=2.5),
+            fill='tozeroy',
+            fillcolor='rgba(255,193,69,0.20)',
             hovertemplate='<b>%{x|%d-%b-%Y}</b><br>Executed Calls: %{y:,.0f}<extra></extra>'
         )
     )
-
+    fig.add_trace(
+        go.Scatter(
+            x=trend_df['Call_Date'],
+            y=trend_df['Planned_Calls'],
+            name='Planned Calls',
+            mode='lines',
+            line=dict(color='#5B5F97', width=2.5),
+            fill='tozeroy',
+            fillcolor='rgba(91,95,151,0.20)',
+            hovertemplate='<b>%{x|%d-%b-%Y}</b><br>Planned Calls: %{y:,.0f}<extra></extra>'
+        )
+    )
     fig.update_layout(
         title=f'📞 Daily Calls Trend (Planned vs Executed){title_suffix}',
         # xaxis=dict(title='Date'),
         yaxis=dict(title='Calls'),
-        barmode='group',
         hovermode='x unified',
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
@@ -2734,7 +3865,7 @@ def create_daily_calls_trend_chart(df, selected_bookers=None, title_suffix=""):
         
         margin=dict(l=8, r=8, t=42, b=8)
     )
-    return apply_theme_aware_bar_labels(fig)
+    return fig
 
 def render_booker_leaderboard_table(df, title, table_key):
     """Render styled leaderboard table using HTML."""
@@ -2748,9 +3879,12 @@ def render_booker_leaderboard_table(df, title, table_key):
         perf_score = int(round(float(row.get('Perf_Score', 0))))
         strike_rate = float(row.get('Strike_Rate', 0))
         calls_per_day = float(row.get('Calls_Per_Day', 0))
+        target_value = float(row.get('Target_Value', 0))
         revenue = float(row.get('Revenue', 0))
         new_outlets = int(round(float(row.get('New_Outlets', 0))))
         avg_order_val = float(row.get('Avg_Order_Val', 0))
+        sku_per_bill = float(row.get('SKU_Per_Bill', 0))
+        achievement_pct = float(row.get('Achievement_Pct', 0))
         booker = str(row.get('Booker', ''))
         region = str(row.get('Region', 'Unknown'))
 
@@ -2761,6 +3895,15 @@ def render_booker_leaderboard_table(df, title, table_key):
         ) if rank <= 3 else "color:#60A5FA;font-weight:700;"
 
         progress_pct = max(0, min(perf_score, 100))
+        achievement_progress = max(0, min(achievement_pct, 100))
+
+        if achievement_pct < 50:
+            ach_color = '#EF4444'
+        elif achievement_pct >= 70:
+            ach_color = '#22C55E'
+        else:
+            ach_color = '#F59E0B'
+
         rows.append(
             "<tr style='border-bottom:1px solid rgba(148,163,184,0.18);'>"
             f"<td style='padding:10px 8px;'><span style=\"{medal_style}\">{rank}</span></td>"
@@ -2768,9 +3911,19 @@ def render_booker_leaderboard_table(df, title, table_key):
             f"<td style='padding:10px 8px;color:#60A5FA;'>{region}</td>"
             f"<td style='padding:10px 8px;color:#00FF85;font-weight:700;'>{strike_rate:.1f}%</td>"
             f"<td style='padding:10px 8px;color:#93C5FD;'>{calls_per_day:.1f}</td>"
+            f"<td style='padding:10px 8px;color:#93C5FD;'>Rs {target_value/1_000_000:.1f}M</td>"
             f"<td style='padding:10px 8px;color:#00E5FF;font-weight:700;'>Rs {revenue/1_000_000:.1f}M</td>"
+            f"<td style='padding:10px 8px;color:#93C5FD;'>{sku_per_bill:.2f}</td>"
             f"<td style='padding:10px 8px;color:#93C5FD;'>{new_outlets}</td>"
             f"<td style='padding:10px 8px;color:#93C5FD;'>Rs {avg_order_val:,.0f}</td>"
+            "<td style='padding:10px 8px;'>"
+            "<div style='display:flex;align-items:center;gap:10px;'>"
+            "<div style='background:#1E3A5F;height:6px;width:120px;border-radius:999px;overflow:hidden;'>"
+            f"<div style='background:{ach_color};height:100%;width:{achievement_progress}%;'></div>"
+            "</div>"
+            f"<span style='color:{ach_color};font-weight:700;'>{achievement_pct:.1f}%</span>"
+            "</div>"
+            "</td>"
             "<td style='padding:10px 8px;'>"
             "<div style='display:flex;align-items:center;gap:10px;'>"
             "<div style='background:#1E3A5F;height:6px;width:120px;border-radius:999px;overflow:hidden;'>"
@@ -2783,8 +3936,24 @@ def render_booker_leaderboard_table(df, title, table_key):
         )
 
     rows_html = "".join(rows)
+    achievement_legend_html = (
+        "<div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 8px 0;'>"
+        "<span style='font-size:11px;letter-spacing:1px;color:#93C5FD;text-transform:uppercase;'>Achievement Bands:</span>"
+        "<span style='display:inline-flex;align-items:center;gap:6px;font-size:11px;color:#E2E8F0;'>"
+        "<span style='width:10px;height:10px;border-radius:2px;background:#EF4444;display:inline-block;'></span>&lt; 50%"
+        "</span>"
+        "<span style='display:inline-flex;align-items:center;gap:6px;font-size:11px;color:#E2E8F0;'>"
+        "<span style='width:10px;height:10px;border-radius:2px;background:#F59E0B;display:inline-block;'></span>50% - 69.9%"
+        "</span>"
+        "<span style='display:inline-flex;align-items:center;gap:6px;font-size:11px;color:#E2E8F0;'>"
+        "<span style='width:10px;height:10px;border-radius:2px;background:#22C55E;display:inline-block;'></span>≥ 70%"
+        "</span>"
+        "</div>"
+    )
+
     table_html = (
         f"<div id='{table_key}' style='background:#071A2E;border:1px solid rgba(59,130,246,0.25);border-radius:12px;padding:12px 12px 8px;'>"
+        f"{achievement_legend_html}"
         f"<div style='font-size:20px;font-weight:700;color:#F8FAFC;margin-bottom:6px;'>{title}</div>"
         "<table style='width:100%;border-collapse:collapse;font-size:13px;'>"
         "<thead>"
@@ -2794,9 +3963,12 @@ def render_booker_leaderboard_table(df, title, table_key):
         "<th style='text-align:left;padding:8px;'>Region</th>"
         "<th style='text-align:left;padding:8px;'>Strike Rate</th>"
         "<th style='text-align:left;padding:8px;'>Calls/Day</th>"
+        "<th style='text-align:left;padding:8px;'>Target</th>"
         "<th style='text-align:left;padding:8px;'>Revenue</th>"
+        "<th style='text-align:left;padding:8px;'>SKU/Bill</th>"
         "<th style='text-align:left;padding:8px;'>New Outlets</th>"
         "<th style='text-align:left;padding:8px;'>Avg Order Val</th>"
+        "<th style='text-align:left;padding:8px;'>Achievement %</th>"
         "<th style='text-align:left;padding:8px;'>Perf Score</th>"
         "</tr>"
         "</thead>"
@@ -2945,6 +4117,8 @@ def render_unified_kpi_card(
     delta_primary_color='#10B981',
     delta_secondary=None,
     delta_secondary_color='#10B981',
+    sparkline_points=None,
+    sparkline_color='#38BDF8',
 ):
     """Render a consistent KPI card style used across tabs."""
     label_safe = escape(str(label))
@@ -2964,12 +4138,47 @@ def render_unified_kpi_card(
         if delta_secondary else ""
     )
 
+    sparkline_html = ""
+    if sparkline_points is not None:
+        try:
+            points = [float(point) for point in list(sparkline_points)]
+            if len(points) >= 2:
+                width, height = 220, 40
+                min_val = min(points)
+                max_val = max(points)
+                value_range = (max_val - min_val) if (max_val - min_val) != 0 else 1.0
+
+                x_step = width / (len(points) - 1)
+                polyline_points = []
+                for idx, point in enumerate(points):
+                    x = idx * x_step
+                    y = height - ((point - min_val) / value_range) * (height - 4) - 2
+                    polyline_points.append(f"{x:.1f},{y:.1f}")
+
+                points_attr = " ".join(polyline_points)
+                gradient_id = f"sparkFill{abs(hash(label_safe)) % 100000}"
+                area_points = f"0,{height - 2} {points_attr} {width},{height - 2}"
+                sparkline_html = (
+                    "<div style='margin-top:10px;background:rgba(59,130,246,0.05);border-radius:8px;padding:2px 2px 0 2px;'>"
+                    f"<svg width='100%' height='{height}' viewBox='0 0 {width} {height}' preserveAspectRatio='none' role='img' aria-label='Trend'>"
+                    f"<defs><linearGradient id='{gradient_id}' x1='0' y1='0' x2='0' y2='1'>"
+                    f"<stop offset='0%' stop-color='{escape(str(sparkline_color), quote=True)}' stop-opacity='0.35'></stop>"
+                    f"<stop offset='100%' stop-color='{escape(str(sparkline_color), quote=True)}' stop-opacity='0.03'></stop>"
+                    "</linearGradient></defs>"
+                    f"<polygon points='{area_points}' fill='url(#{gradient_id})' stroke='none'></polygon>"
+                    f"<polyline fill='none' stroke='{escape(str(sparkline_color), quote=True)}' stroke-width='2.6' points='{points_attr}' stroke-linecap='round' stroke-linejoin='round'></polyline>"
+                    "</svg></div>"
+                )
+        except Exception:
+            sparkline_html = ""
+
     card_html = (
         f"<div style='background:#FFFFFF;border:1px solid #D9E3EF;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(15,23,42,0.08);'>"
         f"<div style='height:4px;background:{line_gradient};'></div>"
         "<div style='padding:14px 16px 14px 16px;text-align:left;'>"
         f"<div style='font-size:12px;letter-spacing:3px;text-transform:uppercase;color:#64748B;margin-bottom:8px;font-weight:500;'>{label_safe}{tooltip_html}</div>"
         f"<div style='font-size:30px;font-weight:700;color:#0F172A;line-height:1.05;'>{value_safe}</div>"
+        f"{sparkline_html}"
         f"{primary_html}{secondary_html}"
         "</div></div>"
     )
@@ -4058,14 +5267,12 @@ def main():
         st.session_state.authenticated = False
         st.session_state.username = None
         st.rerun()
-
+        
     
-    st.sidebar.markdown("---")
-
     # Period selector
-    st.sidebar.subheader("📅 Period")
+    # st.sidebar.subheader("📅 Period")
     period_option = st.sidebar.selectbox(
-        "Select Period",
+        "📅 Select Period",
         options=["Last 7 Days", "Last 30 Days", "This Month", "Last Month", "Last 3 Months", "YTD", "Custom"],
         index=2,
     )
@@ -4116,10 +5323,10 @@ def main():
     st.sidebar.caption(f"Range: {start_date} to {end_date}")
 
     # Location selector
-    st.sidebar.subheader("📍 Location")
+    # st.sidebar.subheader("📍 Location")
     # passed the value and backend will handle the condition to filter data based on all or specific town
     town_code = st.sidebar.selectbox(
-        "Select Location",
+        "📍 Select Location",
         options=["D70002202", "D70002246"],
         format_func=lambda x: "Karachi" if x == "D70002202" else "Lahore"
     )
@@ -4129,11 +5336,37 @@ def main():
     "D70002246": "Lahore",
     }.get(town_code, "Not Available")  # Default case in case of undefined town_code
 
+    st.sidebar.subheader("🕒 Account Last Update")
+    try:
+        last_update_df = fetch_account_last_update_data()
+        if last_update_df is None or last_update_df.empty:
+            st.sidebar.caption("No update information available.")
+        else:
+            account_labels = {
+                "D70002202": "Karachi",
+                "D70002246": "Lahore",
+            }
+            last_update_map = {
+                str(row.get("Distributor_Code", "")): row.get("Last_Update_At")
+                for _, row in last_update_df.iterrows()
+            }
+            for account_code in ["D70002202", "D70002246"]:
+                raw_dt = last_update_map.get(account_code)
+                formatted_dt = "N/A"
+                if pd.notna(raw_dt):
+                    parsed_dt = pd.to_datetime(raw_dt, errors='coerce')
+                    if pd.notna(parsed_dt):
+                        formatted_dt = parsed_dt.strftime("%d-%b-%Y %I:%M %p")
+                selected_marker = "👉 " if account_code == town_code else ""
+                st.sidebar.caption(f"{selected_marker}{account_labels.get(account_code, account_code)}: {formatted_dt}")
+    except Exception as exc:
+        st.sidebar.caption(f"Could not fetch last update info: {exc}")
+
 
     st.balloons()
     # Main content
     st.title(f"📊 Bazaar Prime Analytics Dashboard - {town}")
-    tab1,tab2,tab3,tab4=st.tabs(["📈 Sales Growth Analysis","🎯 Booker Performance","🧭 Booker & Field Force Deep Analysis","🧪 Custom Query"])
+    tab1,tab2,tab3,tab4,tab5=st.tabs(["📈 Sales Growth Analysis","🎯 Booker Performance","🧭 Booker & Field Force Deep Analysis","📦 Inventory","🧪 Custom Query"])
     with tab1:
     # KPIs
         st.subheader("📈 Key Performance Indicator")
@@ -4200,10 +5433,13 @@ def main():
             aov_lm_color = '#16A34A' if aov_growth_lm >= 0 else '#DC2626'
 
             with col1:
+                    kpi_sparkline_series = fetch_kpi_sparkline_series(end_date, town_code)
                     render_unified_kpi_card(
                         label='Total Revenue',
                         value=f"Rs {current_revenue / 1_000_000:.2f}M",
                         line_gradient='linear-gradient(90deg, #06B6D4, #38BDF8)',
+                        sparkline_points=kpi_sparkline_series.get('revenue', []),
+                        sparkline_color='#06B6D4',
                         delta_primary=rev_ly_text,
                         delta_primary_color=rev_ly_color,
                         delta_secondary=rev_lm_text,
@@ -4215,6 +5451,8 @@ def main():
                     label='Total Litres',
                     value=f"{current_ltr:,.0f} Ltr",
                     line_gradient='linear-gradient(90deg, #10B981, #34D399)',
+                    sparkline_points=kpi_sparkline_series.get('litres', []),
+                    sparkline_color='#10B981',
                     delta_primary=ltr_ly_text,
                     delta_primary_color=ltr_ly_color,
                     delta_secondary=ltr_lm_text,
@@ -4226,6 +5464,8 @@ def main():
                     label='Total Orders',
                     value=f"{int(current_orders):,}",
                     line_gradient='linear-gradient(90deg, #8B5CF6, #A78BFA)',
+                    sparkline_points=kpi_sparkline_series.get('orders', []),
+                    sparkline_color='#8B5CF6',
                     delta_primary=ord_ly_text,
                     delta_primary_color=ord_ly_color,
                     delta_secondary=ord_lm_text,
@@ -4237,6 +5477,8 @@ def main():
                     label='Avg Order Value',
                     value=f"Rs {aov_current / 1000:.1f}K",
                     line_gradient='linear-gradient(90deg, #F59E0B, #FBBF24)',
+                    sparkline_points=kpi_sparkline_series.get('aov', []),
+                    sparkline_color='#F59E0B',
                     delta_primary=aov_ly_text,
                     delta_primary_color=aov_ly_color,
                     delta_secondary=aov_lm_text,
@@ -4289,7 +5531,7 @@ def main():
                     0
                 )
                 channel_df = channel_df.sort_values('AOV_Current', ascending=False)
-                st.markdown("---")
+                # st.markdown("---")
                 st.text("📦 Channel-wise Average Order Value (AOV)")
             # Display channels in columns grid inside the 5th column
             # instead of add  manually rows get the count of channels from table to get the count of rows need to loop
@@ -4369,6 +5611,25 @@ def main():
         st.markdown("---")
         st.subheader(f"📈 Brand-wise Growth Percentage")
         col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            brand_channel_options_df = fetch_brand_growth_channel_options(start_date, end_date, town_code)
+            brand_channel_options = ["All"]
+            if (
+                brand_channel_options_df is not None
+                and not brand_channel_options_df.empty
+                and 'Channel' in brand_channel_options_df.columns
+            ):
+                brand_channel_options.extend(
+                    brand_channel_options_df['Channel'].dropna().astype(str).tolist()
+                )
+
+            selected_brand_channel = st.selectbox(
+                "Channel Filter for Brand Growth",
+                options=brand_channel_options,
+                index=0,
+                key="brand_growth_channel_filter"
+            )
+
         with col3:
             metric_filter = st.radio(
                 "Select Metric for Brand Growth",
@@ -4377,8 +5638,34 @@ def main():
                 help="Toggle between Sales Value and Litres growth comparison"
             )
 
-        brand_growth_df = Brand_wise_performance_growth_data(start_date, end_date, town_code)
-        st.plotly_chart(create_brand_wise_growth_chart(brand_growth_df, metric_type=metric_filter), use_container_width=True, key="brand_growth_chart")
+        with col1:
+            st.radio(
+                "Growth Basis",
+                options=['Last Year', 'Last Month'],
+                horizontal=True,
+                key='brand_growth_basis_filter',
+                help='Controls growth/degrowth used for segment sizing and colors.'
+            )
+
+        brand_growth_df = Brand_wise_performance_growth_data(
+            start_date,
+            end_date,
+            town_code,
+            selected_channel=selected_brand_channel
+        )
+        brand_growth_left, brand_growth_right = st.columns(2)
+        with brand_growth_left:
+            st.plotly_chart(
+                create_brand_wise_growth_chart(brand_growth_df, metric_type=metric_filter),
+                use_container_width=True,
+                key="brand_growth_bar_chart"
+            )
+        with brand_growth_right:
+            st.plotly_chart(
+                create_brand_wise_growth_segmented_chart(brand_growth_df, metric_type=metric_filter),
+                use_container_width=True,
+                key="brand_growth_segmented_chart"
+            )
         # DM wise growth percentage chart
         st.markdown("---")
         st.subheader(f"📈 Deliveryman-wise Growth Percentage")
@@ -5540,7 +6827,7 @@ def main():
                     # )
                     leaderboard_view = st.radio(
                         "Leaderboard View",
-                        options=["Top 5", "Bottom 5"],
+                        options=["Top 5", "Bottom 5", "All"],
                         horizontal=True,
                         key="booker_leaderboard_toggle",
                         help="Perf Score (0-100) = weighted performance index using Revenue (35%), Strike Rate (25%), "
@@ -5551,6 +6838,13 @@ def main():
                             bottom_5_df,
                             f"Bottom 5 Performers{title_suffix}",
                             "leaderboard_bottom_5"
+                        )
+                    elif leaderboard_view == "All":
+                        all_ranked_df = leaderboard_df.sort_values('Perf_Score', ascending=False).copy()
+                        render_booker_leaderboard_table(
+                            all_ranked_df,
+                            f"All Performers{title_suffix}",
+                            "leaderboard_all"
                         )
                     else:
                         render_booker_leaderboard_table(
@@ -5564,12 +6858,431 @@ def main():
 
 
     with tab4:
+        st.subheader("📦 Inventory")
+        inventory_data = fetch_inventory_kpi_data(end_date, town_code)
+
+        if inventory_data is None:
+            st.info("No inventory data available for selected account.")
+        else:
+            curr = inventory_data.get('current', {}) or {}
+            prev = inventory_data.get('previous', {}) or {}
+
+            def _delta_text(curr_value, prev_value, unit_suffix="", invert_good=False):
+                if prev_value is None:
+                    return "-", "#64748B"
+                delta = float(curr_value) - float(prev_value)
+                arrow = '▲' if delta >= 0 else '▼'
+                good_up = (delta >= 0 and not invert_good) or (delta < 0 and invert_good)
+                color = '#16A34A' if good_up else '#DC2626'
+                if unit_suffix == "%":
+                    text = f"{arrow} {abs(delta):.1f}%"
+                elif unit_suffix == "days":
+                    text = f"{arrow} {abs(delta):.1f} days"
+                else:
+                    text = f"{arrow} {abs(delta):,.0f}{unit_suffix}"
+                return text, color
+
+            total_skus = int(curr.get('total_skus', 0) or 0)
+            current_inventory_value = float(curr.get('current_inventory_value', 0.0) or 0.0)
+            in_stock_rate = float(curr.get('in_stock_rate', 0.0) or 0.0)
+            oos_skus = int(curr.get('oos_skus', 0) or 0)
+            avg_days_cover = float(curr.get('avg_days_cover', 0.0) or 0.0)
+            slow_movers = int(curr.get('slow_movers', 0) or 0)
+
+            inventory_sparkline = fetch_inventory_ytd_month_end_sparkline(end_date, town_code)
+
+            total_skus_delta, total_skus_color = _delta_text(total_skus, prev.get('total_skus'), unit_suffix="")
+            current_inventory_delta, current_inventory_color = _delta_text(
+                current_inventory_value,
+                prev.get('current_inventory_value'),
+                unit_suffix="",
+            )
+            in_stock_delta, in_stock_color = _delta_text(in_stock_rate, prev.get('in_stock_rate'), unit_suffix="%")
+            oos_delta, oos_color = _delta_text(oos_skus, prev.get('oos_skus'), unit_suffix="", invert_good=True)
+            cover_delta, cover_color = _delta_text(avg_days_cover, prev.get('avg_days_cover'), unit_suffix="days", invert_good=True)
+            slow_delta, slow_color = _delta_text(slow_movers, prev.get('slow_movers'), unit_suffix="", invert_good=True)
+
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            with c1:
+                render_unified_kpi_card(
+                    label='Current Inventory',
+                    value=f"Rs {current_inventory_value / 1_000_000:.2f}M",
+                    line_gradient='linear-gradient(90deg, #14B8A6, #2DD4BF)',
+                    delta_primary=current_inventory_delta,
+                    delta_primary_color=current_inventory_color,
+                    sparkline_points=inventory_sparkline,
+                    sparkline_color='#14B8A6',
+                    tooltip='YTD month-end inventory trend (last available stock day of each month).',
+                )
+                
+            with c2:
+                render_unified_kpi_card(
+                    label='Total SKUs',
+                    value=f"{total_skus:,}",
+                    line_gradient='linear-gradient(90deg, #06B6D4, #38BDF8)',
+                    delta_primary=total_skus_delta,
+                    delta_primary_color=total_skus_color,
+                )
+            with c3:
+                render_unified_kpi_card(
+                    label='In-Stock Rate',
+                    value=f"{in_stock_rate:.1f}%",
+                    line_gradient='linear-gradient(90deg, #10B981, #34D399)',
+                    delta_primary=in_stock_delta,
+                    delta_primary_color=in_stock_color,
+                )
+            with c4:
+                render_unified_kpi_card(
+                    label='OOS SKUs',
+                    value=f"{oos_skus:,}",
+                    line_gradient='linear-gradient(90deg, #EF4444, #F87171)',
+                    delta_primary=oos_delta,
+                    delta_primary_color=oos_color,
+                )
+            with c5:
+                render_unified_kpi_card(
+                    label='Avg Days Cover',
+                    value=f"{avg_days_cover:.1f} days",
+                    line_gradient='linear-gradient(90deg, #F59E0B, #FBBF24)',
+                    delta_primary=cover_delta,
+                    delta_primary_color=cover_color,
+                    tooltip='Weighted by SKU contribution from last 90 days sales: Σ[(Stock/(Sales90/90)) × (SKU Sales90 / Total Sales90)]',
+                )
+            with c6:
+                render_unified_kpi_card(
+                    label='Slow Movers',
+                    value=f"{slow_movers:,} SKUs",
+                    line_gradient='linear-gradient(90deg, #8B5CF6, #A78BFA)',
+                    delta_primary=slow_delta,
+                    delta_primary_color=slow_color,
+                    tooltip="Slow Movers = SKUs with stock > 0 and no sales in last 30 days"
+                )
+
+            latest_dt = inventory_data.get('latest_report_date')
+            prev_dt = inventory_data.get('prev_report_date')
+            if latest_dt:
+                st.caption(f"Stock snapshot date: {latest_dt} | Comparison base: {prev_dt if prev_dt else '-'}")
+
+            chart_data = fetch_inventory_chart_data(end_date, town_code)
+            trend_df = chart_data.get('trend', pd.DataFrame())
+            days_cover_df = chart_data.get('days_cover', pd.DataFrame())
+
+            st.markdown(
+                """
+                <style>
+                div[data-testid="stPlotlyChart"] {
+                    background: #FFFFFF;
+                    border: 1px solid #D9E3EF;
+                    border-radius: 12px;
+                    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
+                    padding: 6px;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            ch1, ch2 = st.columns(2)
+
+            with ch1:
+                st.markdown("#### Stock Movement Trend")
+                if trend_df is None or trend_df.empty:
+                    st.info("No stock movement trend data available.")
+                else:
+                    trend_plot = trend_df.copy()
+                    trend_plot['Report_Date'] = pd.to_datetime(trend_plot['Report_Date'], errors='coerce')
+                    trend_plot = trend_plot.dropna(subset=['Report_Date']).sort_values('Report_Date')
+
+                    fig_trend = go.Figure()
+                    fig_trend.add_trace(go.Scatter(
+                        x=trend_plot['Report_Date'],
+                        y=trend_plot['Inflow_Value'],
+                        mode='lines',
+                        name='Inflow',
+                        line=dict(color='#22C55E', width=2),
+                        fill='tozeroy',
+                        fillcolor='rgba(34, 197, 94, 0.15)'
+                    ))
+                    fig_trend.add_trace(go.Scatter(
+                        x=trend_plot['Report_Date'],
+                        y=trend_plot['Outflow_Value'],
+                        mode='lines',
+                        name='Outflow',
+                        line=dict(color='#3B82F6', width=2),
+                        fill='tozeroy',
+                        fillcolor='rgba(59, 130, 246, 0.12)'
+                    ))
+                    fig_trend.update_layout(
+                        margin=dict(t=10, b=10, l=10, r=10),
+                        height=360,
+                        paper_bgcolor='#FFFFFF',
+                        plot_bgcolor='#FFFFFF',
+                        xaxis=dict(title=None, showgrid=False, showline=True, linecolor='#E2E8F0', linewidth=1),
+                        yaxis=dict(title=None, gridcolor='rgba(148,163,184,0.15)', tickformat=',.0f', showline=True, linecolor='#E2E8F0', linewidth=1),
+                        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                    )
+                    st.plotly_chart(fig_trend, use_container_width=True)
+
+            with ch2:
+                st.markdown("#### Days Cover by Category")
+                if days_cover_df is None or days_cover_df.empty:
+                    st.info("No category-level days cover data available.")
+                else:
+                    cover_plot = days_cover_df.copy()
+                    cover_plot['Days_Cover'] = pd.to_numeric(cover_plot['Days_Cover'], errors='coerce').fillna(0)
+                    cover_plot = cover_plot.sort_values('Days_Cover', ascending=False).head(12)
+
+                    def _cover_color(v):
+                        if v < 7:
+                            return '#EF4444'
+                        if v <= 14:
+                            return '#F59E0B'
+                        return '#22C55E'
+
+                    cover_plot['Color'] = cover_plot['Days_Cover'].apply(_cover_color)
+                    cover_plot['Category_Short'] = cover_plot['Category'].astype(str).apply(
+                        lambda txt: txt if len(txt) <= 18 else f"{txt[:18]}..."
+                    )
+
+                    fig_cover = go.Figure(go.Bar(
+                        x=cover_plot['Category_Short'],
+                        y=cover_plot['Days_Cover'],
+                        marker_color=cover_plot['Color'],
+                        text=cover_plot['Days_Cover'].round(1),
+                        textposition='outside',
+                        customdata=cover_plot[['Category']],
+                        hovertemplate='<b>%{customdata[0]}</b><br>Days Cover: %{y:.1f}<extra></extra>'
+                    ))
+                    fig_cover.add_hline(y=7, line_dash='dash', line_color='rgba(239,68,68,0.6)', line_width=1)
+                    fig_cover.add_hline(y=14, line_dash='dash', line_color='rgba(245,158,11,0.6)', line_width=1)
+                    fig_cover.update_layout(
+                        margin=dict(t=10, b=10, l=10, r=10),
+                        height=360,
+                        paper_bgcolor='#FFFFFF',
+                        plot_bgcolor='#FFFFFF',
+                        xaxis=dict(title=None, tickangle=-30, showline=True, linecolor='#E2E8F0', linewidth=1),
+                        yaxis=dict(title=None, gridcolor='rgba(148,163,184,0.15)', showline=True, linecolor='#E2E8F0', linewidth=1),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig_cover, use_container_width=True)
+                    st.caption("Thresholds: Red < 7 days | Amber 7-14 days | Green > 14 days")
+
+            health_data = fetch_inventory_health_data(end_date, town_code)
+            if health_data:
+                with st.expander("Stock Cover Bucket Settings", expanded=False):
+                    b1, b2, b3, b4, b5 = st.columns(5)
+                    with b1:
+                        bucket_1 = st.number_input("B1", min_value=1, value=7, step=1, key="inv_bucket_1")
+                    with b2:
+                        bucket_2 = st.number_input("B2", min_value=1, value=15, step=1, key="inv_bucket_2")
+                    with b3:
+                        bucket_3 = st.number_input("B3", min_value=1, value=30, step=1, key="inv_bucket_3")
+                    with b4:
+                        bucket_4 = st.number_input("B4", min_value=1, value=45, step=1, key="inv_bucket_4")
+                    with b5:
+                        bucket_5 = st.number_input("B5", min_value=1, value=60, step=1, key="inv_bucket_5")
+                    st.caption("Buckets: <B1, B1-B2, B2-B3, B3-B4, B4-B5, B5+, Zero Sale")
+
+                raw_thresholds = [int(bucket_1), int(bucket_2), int(bucket_3), int(bucket_4), int(bucket_5)]
+                if raw_thresholds != sorted(raw_thresholds):
+                    st.warning("Bucket limits were auto-sorted because they were not in ascending order.")
+                thresholds = tuple(sorted(raw_thresholds))
+
+                cover_matrix_data = fetch_inventory_cover_bucket_matrix(end_date, town_code, thresholds)
+                cover_table = cover_matrix_data.get('table', pd.DataFrame())
+                cover_pct = cover_matrix_data.get('percentages', {}) or {}
+                bucket_order = cover_matrix_data.get('bucket_columns', []) or []
+
+                st.markdown("### Stock Cover Days")
+
+                def _fmt_short_rupee(v):
+                    value = float(v or 0)
+                    abs_value = abs(value)
+                    if abs_value >= 1_000_000:
+                        return f"{value / 1_000_000:.1f}m"
+                    if abs_value >= 1_000:
+                        return f"{value / 1_000:.1f}k"
+                    return f"{value:.0f}"
+
+                if cover_table is None or cover_table.empty:
+                    st.info("No stock cover bucket data available.")
+                else:
+                    bucket_cell_styles = {
+                        bucket_order[0]: ('#FEF2F2', '#B91C1C') if len(bucket_order) > 0 else ('#FFFFFF', '#0F172A'),
+                        bucket_order[1]: ('#FFF7ED', '#C2410C') if len(bucket_order) > 1 else ('#FFFFFF', '#0F172A'),
+                        bucket_order[2]: ('#FFFBEB', '#A16207') if len(bucket_order) > 2 else ('#FFFFFF', '#0F172A'),
+                        bucket_order[3]: ('#F8FAFC', '#334155') if len(bucket_order) > 3 else ('#FFFFFF', '#0F172A'),
+                        bucket_order[4]: ('#ECFDF5', '#047857') if len(bucket_order) > 4 else ('#FFFFFF', '#0F172A'),
+                        bucket_order[5]: ('#DCFCE7', '#15803D') if len(bucket_order) > 5 else ('#FFFFFF', '#0F172A'),
+                        bucket_order[6]: ('#FEE2E2', '#991B1B') if len(bucket_order) > 6 else ('#FFFFFF', '#0F172A'),
+                    }
+
+                    pct_cells = "".join([
+                        f"<th style='padding:7px 8px;color:{bucket_cell_styles.get(col, ('#EEF2FF', '#0F172A'))[1]};background:{bucket_cell_styles.get(col, ('#EEF2FF', '#0F172A'))[0]};text-align:center;font-size:12px;font-weight:700;border-bottom:1px solid #E2E8F0;'>{cover_pct.get(col, 0.0):.1f}%</th>"
+                        for col in bucket_order
+                    ])
+
+                    header_cells = "".join([
+                        "<th style='padding:10px 8px;background:#F8FAFC;color:#334155;text-align:center;font-size:12px;letter-spacing:0.04em;text-transform:uppercase;border-bottom:1px solid #E2E8F0;'>Account</th>",
+                        "<th style='padding:10px 8px;background:#F8FAFC;color:#334155;text-align:center;font-size:12px;letter-spacing:0.04em;text-transform:uppercase;border-bottom:1px solid #E2E8F0;'>Total Inventory</th>",
+                    ] + [
+                        f"<th style='padding:10px 8px;background:#F8FAFC;color:#334155;text-align:center;font-size:12px;letter-spacing:0.04em;text-transform:uppercase;border-bottom:1px solid #E2E8F0;'>{col}</th>"
+                        for col in bucket_order
+                    ])
+
+                    row_html = ""
+                    for idx, row in cover_table.iterrows():
+                        font_w = '500'
+                        bg = '#FFFFFF' if idx % 2 == 0 else '#FAFCFF'
+                        row_border = "border-bottom:1px solid #EEF2F7;"
+                        cells = [
+                            f"<td style='padding:9px 10px;background:{bg};font-weight:{font_w};text-align:left;color:#0F172A;{row_border}'>{escape(str(row.get('Account', '')))}</td>",
+                            f"<td style='padding:9px 8px;background:{bg};font-weight:{font_w};text-align:center;color:#0F172A;{row_border}'>{_fmt_short_rupee(row.get('Total Inventory', 0))}</td>",
+                        ]
+                        for col in bucket_order:
+                            cell_bg, cell_text = bucket_cell_styles.get(col, ('#FFFFFF', '#0F172A'))
+                            cells.append(
+                                f"<td style='padding:9px 8px;background:{cell_bg};font-weight:600;text-align:center;color:{cell_text};{row_border}'>{_fmt_short_rupee(row.get(col, 0))}</td>"
+                            )
+                        row_html += f"<tr>{''.join(cells)}</tr>"
+
+                    st.markdown(
+                        f"""
+                        <div style="border:1px solid #D9E3EF;border-radius:12px;overflow:hidden;background:#FFFFFF;box-shadow:0 2px 8px rgba(15,23,42,0.06);">
+                            <div style="padding:12px 14px;background:#FFFFFF;border-bottom:1px solid #E2E8F0;">
+                                <div style="font-size:15px;font-weight:700;color:#0F172A;">Stock Cover Days (as per Salesflo)</div>
+                            </div>
+                            <div style="overflow:auto;">
+                            <table style="width:100%;border-collapse:collapse;min-width:1100px;">
+                                <thead>
+                                    <tr>
+                                        <th colspan="2" style="background:#EEF2FF;padding:7px 8px;border-bottom:1px solid #E2E8F0;"></th>
+                                        {pct_cells}
+                                    </tr>
+                                    <tr>
+                                        {header_cells}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {row_html}
+                                </tbody>
+                            </table>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                st.markdown("### Inventory Health")
+
+                def _health_color(metric_name, metric_value):
+                    if metric_name == 'dead_stock_value':
+                        return '#FF4D6D' if metric_value > 0 else '#00E676'
+                    if metric_name == 'wastage_rate':
+                        if metric_value >= 2:
+                            return '#FF4D6D'
+                        if metric_value >= 1:
+                            return '#FFB020'
+                        return '#00E676'
+                    if metric_name in {'inventory_turnover', 'gmroii'}:
+                        if metric_value >= 3:
+                            return '#00E676'
+                        if metric_value >= 1.5:
+                            return '#FFB020'
+                        return '#FF6B35'
+                    if metric_name in {'avg_replenishment_cycle', 'safety_stock_coverage'}:
+                        if metric_value <= 5:
+                            return '#00E5FF'
+                        if metric_value <= 10:
+                            return '#FFB020'
+                        return '#FF6B35'
+                    return '#00E676'
+
+                inventory_turnover = float(health_data.get('inventory_turnover', 0) or 0)
+                dead_stock_value = float(health_data.get('dead_stock_value', 0) or 0)
+                dead_sku_count = int(health_data.get('dead_sku_count', 0) or 0)
+                avg_replenishment_cycle = float(health_data.get('avg_replenishment_cycle', 0) or 0)
+                wastage_rate = float(health_data.get('wastage_rate', 0) or 0)
+                gmroii = float(health_data.get('gmroii', 0) or 0)
+                safety_stock_coverage = float(health_data.get('safety_stock_coverage', 0) or 0)
+
+                metric_tooltips = {
+                    'inventory_turnover': 'Total sales over last 90 days divided by average stock value over same period.',
+                    'dead_stock_value': 'Current stock value of SKUs where last-90-day sales contribution is <2% and stock cover days is >25.',
+                    'avg_replenishment_cycle': 'Average days between positive stock refill events based on daily stock movement.',
+                    'wastage_rate': 'Dead stock value as a percentage of total current stock value.',
+                    'gmroii': 'Gross margin return proxy: last 30-day sales value divided by average stock value for last 30 days.',
+                    'safety_stock_coverage': 'Current stock value divided by average daily sales for last 30 days, shown in days.',
+                }
+
+                rows = [
+                    ('Inventory Turnover', f"{inventory_turnover:.1f}x", _health_color('inventory_turnover', inventory_turnover), metric_tooltips['inventory_turnover']),
+                    ('Dead Stock Value', f"Rs {dead_stock_value / 1_000_000:.1f}M ({dead_sku_count:,} SKUs)", _health_color('dead_stock_value', dead_stock_value), metric_tooltips['dead_stock_value']),
+                    ('Avg Replenishment Cycle', f"{avg_replenishment_cycle:.1f} days", _health_color('avg_replenishment_cycle', avg_replenishment_cycle), metric_tooltips['avg_replenishment_cycle']),
+                    ('Wastage Rate', f"{wastage_rate:.2f}%", _health_color('wastage_rate', wastage_rate), metric_tooltips['wastage_rate']),
+                    ('GMROII', f"{gmroii:.1f}x", _health_color('gmroii', gmroii), metric_tooltips['gmroii']),
+                    ('Safety Stock Coverage', f"{safety_stock_coverage:.1f} days", _health_color('safety_stock_coverage', safety_stock_coverage), metric_tooltips['safety_stock_coverage']),
+                ]
+
+                rows_html = ""
+                for idx, (name, value, color, tooltip_text) in enumerate(rows):
+                    border = "border-bottom: 1px solid rgba(71, 85, 105, 0.35);" if idx < len(rows) - 1 else ""
+                    safe_tooltip = str(tooltip_text).replace("'", "&#39;").replace('"', '&quot;')
+                    rows_html += (
+                        f"<div style='display:flex; justify-content:space-between; align-items:center; padding: 12px 0; {border}'>"
+                        f"<div style='display:flex; align-items:center; gap:10px;'>"
+                        f"<div title='{safe_tooltip}' style='color:#93C5FD; font-size:24px; font-weight:500; letter-spacing:0.2px; cursor:help;'>{name}</div>"
+                        f"<span title='{safe_tooltip}' style='display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border-radius:999px; border:1px solid rgba(147,197,253,0.45); color:#93C5FD; font-size:12px; line-height:1; cursor:help;'>i</span>"
+                        f"</div>"
+                        f"<div style='color:{color}; font-size:32px; font-weight:700; letter-spacing:0.3px;'>{value}</div>"
+                        "</div>"
+                    )
+
+                st.markdown(
+                    f"""
+                    <div style="
+                        background: linear-gradient(180deg, rgba(2,15,35,0.95) 0%, rgba(4,24,50,0.95) 100%);
+                        border: 1px solid rgba(30, 64, 175, 0.25);
+                        border-radius: 14px;
+                        padding: 12px 18px 8px 18px;
+                        box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+                    ">
+                        {rows_html}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                dead_sku_details = health_data.get('dead_sku_details', pd.DataFrame())
+                with st.expander(f"Dead Stock SKU-wise Detail ({dead_sku_count:,} SKUs)", expanded=False):
+                    if dead_sku_details is None or dead_sku_details.empty:
+                        st.info("No dead stock SKUs found for the selected period and rules.")
+                    else:
+                        detail_df = dead_sku_details.copy()
+                        detail_df['Stock Value'] = pd.to_numeric(detail_df['Stock Value'], errors='coerce').fillna(0)
+                        detail_df['Sales 90D'] = pd.to_numeric(detail_df['Sales 90D'], errors='coerce').fillna(0)
+                        detail_df['Sales Contribution %'] = pd.to_numeric(detail_df['Sales Contribution %'], errors='coerce').fillna(0)
+                        detail_df['Cover Days'] = pd.to_numeric(detail_df['Cover Days'], errors='coerce')
+                        st.dataframe(
+                            detail_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                'SKU Name': st.column_config.TextColumn('SKU Name'),
+                                'Stock Value': st.column_config.NumberColumn('Stock Value', format='%.2f'),
+                                'Sales 90D': st.column_config.NumberColumn('Sales 90D', format='%.2f'),
+                                'Sales Contribution %': st.column_config.NumberColumn('Sales Contribution %', format='%.2f%%'),
+                                'Cover Days': st.column_config.NumberColumn('Cover Days', format='%.1f'),
+                            },
+                        )
+
+    with tab5:
         st.subheader("🧪 Custom Query Runner")
         st.caption("Run read-only SQL queries on current database. Only single SELECT statements are allowed.")
 
         default_query = (
             "SELECT `Order Booker Name`, ROUND(SUM(`Delivered Amount` + `Total Discount`),0) AS NMV\n"
-            "FROM ordervsdelivered\n"
+            "FROM ordered_vs_delivered_rows\n"
             f"WHERE `Distributor Code` = '{town_code}'\n"
             "GROUP BY `Order Booker Name`\n"
             "ORDER BY NMV DESC\n"
@@ -5580,7 +7293,7 @@ def main():
             "Booker-wise NMV (Top 50)": default_query,
             "Brand-wise Sales (Top 20)": (
                 "SELECT m.brand AS Brand, ROUND(SUM(o.`Delivered Amount` + o.`Total Discount`),0) AS NMV\n"
-                "FROM ordervsdelivered o\n"
+                "FROM ordered_vs_delivered_rows o\n"
                 "LEFT JOIN sku_master m ON m.`Sku_Code` = o.`SKU Code`\n"
                 f"WHERE o.`Distributor Code` = '{town_code}'\n"
                 "GROUP BY m.brand\n"
@@ -5589,7 +7302,7 @@ def main():
             ),
             "Daily Sales Trend (Last 30 days)": (
                 "SELECT DATE(`Delivery Date`) AS Day, ROUND(SUM(`Delivered Amount` + `Total Discount`),0) AS NMV\n"
-                "FROM ordervsdelivered\n"
+                "FROM ordered_vs_delivered_rows\n"
                 f"WHERE `Distributor Code` = '{town_code}'\n"
                 "  AND `Delivery Date` >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)\n"
                 "GROUP BY DATE(`Delivery Date`)\n"
@@ -5597,7 +7310,7 @@ def main():
             ),
             "Top 25 Outlets by NMV": (
                 "SELECT `Store Name` AS Outlet, ROUND(SUM(`Delivered Amount` + `Total Discount`),0) AS NMV\n"
-                "FROM ordervsdelivered\n"
+                "FROM ordered_vs_delivered_rows\n"
                 f"WHERE `Distributor Code` = '{town_code}'\n"
                 "GROUP BY `Store Name`\n"
                 "ORDER BY NMV DESC\n"
