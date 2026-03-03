@@ -14,6 +14,8 @@ import logging
 import os
 import re
 import hashlib
+import subprocess
+import sys
 from pathlib import Path
 from datetime import datetime, timedelta, date as date_type
 from typing import Optional
@@ -2692,6 +2694,38 @@ def _parse_forced_period() -> tuple[Optional[date_type], Optional[date_type]]:
     return forced_start, forced_end
 
 
+async def _launch_browser_with_bootstrap(pw):
+    try:
+        return await pw.chromium.launch(headless=True)
+    except Exception as exc:
+        err_text = str(exc)
+        missing_browser = (
+            "Executable doesn't exist" in err_text
+            or "Please run the following command to download new browsers" in err_text
+        )
+        if not missing_browser:
+            raise
+
+        log.warning("Playwright Chromium not found. Attempting one-time install for this environment...")
+        install_cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+        install_proc = subprocess.run(
+            install_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if install_proc.returncode != 0:
+            log.error("Playwright install failed (exit=%s).", install_proc.returncode)
+            if install_proc.stdout:
+                log.error("Playwright install stdout: %s", install_proc.stdout[-2000:])
+            if install_proc.stderr:
+                log.error("Playwright install stderr: %s", install_proc.stderr[-2000:])
+            raise RuntimeError("Playwright browser install failed on cloud runtime.") from exc
+
+        log.info("Playwright Chromium installed successfully. Retrying browser launch...")
+        return await pw.chromium.launch(headless=True)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN BOT RUN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2731,7 +2765,7 @@ async def run_bot():
         await ensure_tables(conn)
 
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
+            browser = await _launch_browser_with_bootstrap(pw)
 
             try:
                 aggregate_status = "no_data"
