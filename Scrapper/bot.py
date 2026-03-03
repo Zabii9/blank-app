@@ -2698,6 +2698,15 @@ def _parse_forced_period() -> tuple[Optional[date_type], Optional[date_type]]:
 
 async def run_bot():
     log.info("BOT RUN STARTED")
+    log.info(
+        "Config check | DB_HOST=%s | DB_PORT=%s | DB_NAME=%s | DB_USER_SET=%s | DB_PASS_SET=%s | SALESFLO_USER_SET=%s",
+        "set" if str(DB_HOST or "").strip() else "missing",
+        str(DB_PORT or "").strip() or "missing",
+        str(DB_NAME or "").strip() or "missing",
+        "yes" if str(DB_USER or "").strip() else "no",
+        "yes" if str(DB_PASS or "").strip() else "no",
+        "yes" if str(USERNAME or "").strip() else "no",
+    )
 
     status = "failed"
     saved = 0
