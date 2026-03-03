@@ -130,7 +130,7 @@ DB_HOST = _resolve_secret(
     _DB_SECRETS,
     ["host", "DB_HOST"],
     ["DB_HOST"],
-    "your-mysql-host",
+    "",
 )
 DB_PORT = int(_resolve_secret(
     _DB_SECRETS,
@@ -142,13 +142,13 @@ DB_USER = _resolve_secret(
     _DB_SECRETS,
     ["username", "user", "DB_USER", "DB_USERNAME"],
     ["DB_USER", "DB_USERNAME"],
-    "your-db-user",
+    "",
 )
 DB_PASS = _resolve_secret(
     _DB_SECRETS,
     ["password", "pass", "DB_PASSWORD", "DB_PASS"],
     ["DB_PASSWORD", "DB_PASS"],
-    "your-db-password",
+    "",
 )
 DB_NAME = _resolve_secret(
     _DB_SECRETS,

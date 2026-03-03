@@ -5397,6 +5397,73 @@ def _start_bot_process(extra_env=None):
     return process.pid
 
 
+def _get_bot_runtime_env():
+    runtime_env = {}
+
+    secrets_db = {}
+    secrets_salesflo = {}
+    try:
+        if "database" in st.secrets and isinstance(st.secrets["database"], dict):
+            secrets_db = st.secrets["database"]
+    except Exception:
+        secrets_db = {}
+
+    try:
+        if "salesflo" in st.secrets and isinstance(st.secrets["salesflo"], dict):
+            secrets_salesflo = st.secrets["salesflo"]
+    except Exception:
+        secrets_salesflo = {}
+
+    db_user = secrets_db.get("username") or os.getenv("DB_USER") or os.getenv("DB_USERNAME") or ""
+    db_pass = secrets_db.get("password") or os.getenv("DB_PASSWORD") or os.getenv("DB_PASS") or ""
+    db_host = secrets_db.get("host") or os.getenv("DB_HOST") or ""
+    db_port = str(secrets_db.get("port") or os.getenv("DB_PORT") or "3306")
+    db_name = secrets_db.get("database") or os.getenv("DB_NAME") or ""
+
+    if db_user:
+        runtime_env["DB_USER"] = str(db_user)
+        runtime_env["DB_USERNAME"] = str(db_user)
+    if db_pass:
+        runtime_env["DB_PASSWORD"] = str(db_pass)
+        runtime_env["DB_PASS"] = str(db_pass)
+    if db_host:
+        runtime_env["DB_HOST"] = str(db_host)
+    if db_port:
+        runtime_env["DB_PORT"] = str(db_port)
+    if db_name:
+        runtime_env["DB_NAME"] = str(db_name)
+
+    sf_user = secrets_salesflo.get("SALESFLO_USERNAME") or secrets_salesflo.get("username") or os.getenv("SALESFLO_USERNAME") or ""
+    sf_pass = secrets_salesflo.get("SALESFLO_PASSWORD") or secrets_salesflo.get("password") or os.getenv("SALESFLO_PASSWORD") or ""
+    sf_user2 = (
+        secrets_salesflo.get("SALESFLO_USERNAME2")
+        or secrets_salesflo.get("SALESFLO_USERNAME_2")
+        or secrets_salesflo.get("username2")
+        or os.getenv("SALESFLO_USERNAME2")
+        or os.getenv("SALESFLO_USERNAME_2")
+        or ""
+    )
+    sf_pass2 = (
+        secrets_salesflo.get("SALESFLO_PASSWORD2")
+        or secrets_salesflo.get("SALESFLO_PASSWORD_2")
+        or secrets_salesflo.get("password2")
+        or os.getenv("SALESFLO_PASSWORD2")
+        or os.getenv("SALESFLO_PASSWORD_2")
+        or ""
+    )
+
+    if sf_user:
+        runtime_env["SALESFLO_USERNAME"] = str(sf_user)
+    if sf_pass:
+        runtime_env["SALESFLO_PASSWORD"] = str(sf_pass)
+    if sf_user2:
+        runtime_env["SALESFLO_USERNAME2"] = str(sf_user2)
+    if sf_pass2:
+        runtime_env["SALESFLO_PASSWORD2"] = str(sf_pass2)
+
+    return runtime_env
+
+
 def _get_refresh_data_password():
     def _load_user_streamlit_secrets() -> dict:
         if tomllib is None:
@@ -7882,7 +7949,7 @@ def main():
                     try:
                         current_log_path = _get_primary_bot_log_path()
                         current_log_start = _safe_file_size(current_log_path)
-                        new_pid = _start_bot_process()
+                        new_pid = _start_bot_process(extra_env=_get_bot_runtime_env())
                         st.session_state["bot_runner_pid"] = int(new_pid)
                         st.session_state["bot_runner_log_path"] = current_log_path
                         st.session_state["bot_runner_log_start_pos"] = int(current_log_start)
@@ -7941,11 +8008,15 @@ def main():
                         try:
                             current_log_path = _get_primary_bot_log_path()
                             current_log_start = _safe_file_size(current_log_path)
-                            new_pid = _start_bot_process(
-                                extra_env={
+                            refresh_env = _get_bot_runtime_env()
+                            refresh_env.update(
+                                {
                                     "FORCE_START_DATE": str(start_date),
                                     "FORCE_END_DATE": str(end_date),
                                 }
+                            )
+                            new_pid = _start_bot_process(
+                                extra_env=refresh_env
                             )
                             st.session_state["bot_runner_pid"] = int(new_pid)
                             st.session_state["bot_runner_log_path"] = current_log_path
