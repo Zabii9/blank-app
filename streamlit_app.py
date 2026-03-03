@@ -15,8 +15,18 @@ from datetime import datetime, timedelta
 import numpy as np
 import os
 import re
+import sys
+import subprocess
+import time
+import signal
+from pathlib import Path
 from dotenv import load_dotenv
 from html import escape
+
+try:
+    import tomllib  # Python 3.11+
+except Exception:
+    tomllib = None
 
 # Load environment variables
 load_dotenv()
@@ -3715,25 +3725,50 @@ def create_routewise_sales_performance_chart(df, title_suffix=""):
     df_plot['Achieved_Value'] = pd.to_numeric(df_plot.get('Achieved_Value', 0), errors='coerce').fillna(0)
     df_plot['Target_Value'] = pd.to_numeric(df_plot.get('Target_Value', 0), errors='coerce').fillna(0)
     df_plot['Achieved_Pct'] = pd.to_numeric(df_plot.get('Achieved_Pct', 0), errors='coerce').fillna(0)
-    df_plot = df_plot.sort_values('Achieved_Pct', ascending=False).head(15)
+    df_plot['Booker'] = df_plot.get('Booker', '').astype(str)
+    df_plot = df_plot.sort_values('Booker', ascending=True)
     df_plot['Target_Pct'] = 100
+
+    def _achieved_band_color(pct):
+        pct = float(pct or 0)
+        if pct < 50:
+            return '#EF4444'
+        if pct < 60:
+            return '#F97316'
+        if pct <= 70:
+            return '#FACC15'
+        return '#22C55E'
+
+    def _achieved_band_label(pct):
+        pct = float(pct or 0)
+        if pct < 50:
+            return 'Red (<50%)'
+        if pct < 60:
+            return 'Orange (50-60%)'
+        if pct <= 70:
+            return 'Yellow (60-70%)'
+        return 'Green (>70%)'
+
+    achieved_colors = df_plot['Achieved_Pct'].apply(_achieved_band_color).tolist()
+    achieved_bands = df_plot['Achieved_Pct'].apply(_achieved_band_label).tolist()
 
     def _short_label(text, max_len=12):
         text = str(text)
         return text if len(text) <= max_len else f"{text[:max_len-1]}…"
 
-    df_plot['Booker_Display'] = df_plot['Booker'].astype(str).apply(_short_label)
-
-    achieved_customdata = np.column_stack([df_plot['Booker'], df_plot['Achieved_Value'], df_plot['Target_Value']])
+    achieved_customdata = np.column_stack([df_plot['Booker'], df_plot['Achieved_Value'], df_plot['Target_Value'], achieved_bands])
     target_customdata = np.column_stack([df_plot['Booker'], df_plot['Target_Value'], df_plot['Achieved_Value']])
+
+    x_values = df_plot['Booker'].astype(str).tolist()
+    x_tick_text = [ _short_label(booker, max_len=14) for booker in x_values ]
 
     fig = go.Figure()
     fig.add_trace(
         go.Bar(
-            x=df_plot['Booker_Display'],
+            x=x_values,
             y=df_plot['Achieved_Pct'],
             name='Achieved',
-            marker_color='#5B5F97',
+            marker_color=achieved_colors,
             text=df_plot['Achieved_Pct'].apply(lambda value: f"{value:.1f}%"),
             textposition='outside',
             customdata=achieved_customdata,
@@ -3742,16 +3777,17 @@ def create_routewise_sales_performance_chart(df, title_suffix=""):
                 '<br>Achieved %: %{y:.1f}%'
                 '<br>Achieved Value: Rs %{customdata[1]:,.0f}'
                 '<br>Target Value: Rs %{customdata[2]:,.0f}'
+                '<br>Band: %{customdata[3]}'
                 '<extra></extra>'
             )
         )
     )
     fig.add_trace(
         go.Bar(
-            x=df_plot['Booker_Display'],
+            x=x_values,
             y=df_plot['Target_Pct'],
             name='Target',
-            marker_color='#FFC145',
+            marker_color='#9CA3AF',
             text=df_plot['Target_Value'].apply(lambda value: f"{value/1e6:.0f}M"),
             textposition='outside',
             customdata=target_customdata,
@@ -3768,7 +3804,12 @@ def create_routewise_sales_performance_chart(df, title_suffix=""):
     fig.update_layout(
         title=f'📊 Route-wise Sales Performance (Achieved vs Target per OB){title_suffix}',
         yaxis=dict(title='Achievement %'),
-        # xaxis=dict(title='OB / Route', tickangle=-30),
+        xaxis=dict(
+            tickmode='array',
+            tickvals=x_values,
+            ticktext=x_tick_text,
+            tickangle=-25,
+        ),
         barmode='group',
         hovermode='x unified',
         paper_bgcolor='rgba(0,0,0,0)',
@@ -5133,6 +5174,37 @@ section[data-testid="stSidebar"] {
     background: linear-gradient(180deg, #B8B8D1, #B8B8D1);
 }
 
+div[data-testid="stPlotlyChart"] {
+    overflow-x: hidden !important;
+    overflow-y: hidden !important;
+}
+
+div[data-testid="stPlotlyChart"] > div {
+    overflow: hidden !important;
+    max-width: 100% !important;
+    max-height: 100% !important;
+}
+
+div[data-testid="stPlotlyChart"] .js-plotly-plot,
+div[data-testid="stPlotlyChart"] .plotly,
+div[data-testid="stPlotlyChart"] .plot-container {
+    width: 100% !important;
+    max-width: 100% !important;
+    overflow: hidden !important;
+}
+
+div[data-testid="stPlotlyChart"] .svg-container,
+div[data-testid="stPlotlyChart"] .main-svg,
+div[data-testid="stPlotlyChart"] .cartesianlayer,
+div[data-testid="stPlotlyChart"] .gl-container {
+    overflow: hidden !important;
+}
+
+div[data-testid="stPlotlyChart"] [style*="overflow: auto"],
+div[data-testid="stPlotlyChart"] [style*="overflow:auto"] {
+    overflow: hidden !important;
+}
+
 .js-plotly-plot .sankey .node text {
     text-shadow: none !important;
     filter: none !important;
@@ -5251,6 +5323,269 @@ def AOV_MOPU_bar_chart(df):
 # 🎯 MAIN APP
 # ======================
 
+def _get_bot_script_path():
+    return os.path.join(os.path.dirname(__file__), "Scrapper", "bot.py")
+
+
+def _get_bot_log_candidates():
+    base_dir = os.path.dirname(__file__)
+    return [
+        os.path.join(base_dir, "salesflo_bot.log"),
+        os.path.join(base_dir, "Scrapper", "salesflo_bot.log"),
+    ]
+
+
+def _get_primary_bot_log_path():
+    return _get_bot_log_candidates()[0]
+
+
+def _safe_file_size(path):
+    try:
+        if path and os.path.exists(path):
+            return int(os.path.getsize(path))
+    except Exception:
+        return 0
+    return 0
+
+
+def _is_pid_running(pid):
+    try:
+        if pid is None:
+            return False
+        pid_int = int(pid)
+    except Exception:
+        return False
+
+    try:
+        if os.name == "nt":
+            check = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid_int}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return str(pid_int) in (check.stdout or "")
+        os.kill(pid_int, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _start_bot_process(extra_env=None):
+    bot_script = _get_bot_script_path()
+    if not os.path.exists(bot_script):
+        raise FileNotFoundError(f"Bot script not found: {bot_script}")
+
+    log_path = _get_primary_bot_log_path()
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        process_env = os.environ.copy()
+        if isinstance(extra_env, dict):
+            for key, value in extra_env.items():
+                if value is not None:
+                    process_env[str(key)] = str(value)
+        process = subprocess.Popen(
+            [sys.executable, bot_script],
+            cwd=os.path.dirname(__file__),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            creationflags=creation_flags,
+            env=process_env,
+        )
+    return process.pid
+
+
+def _get_refresh_data_password():
+    def _load_user_streamlit_secrets() -> dict:
+        if tomllib is None:
+            return {}
+
+        configured_secret_path = (
+            os.getenv("STREAMLIT_SECRETS_FILE")
+            or os.getenv("SECRETS_FILE")
+            or ""
+        ).strip()
+
+        candidate_paths = [
+            Path(configured_secret_path) if configured_secret_path else None,
+            Path.home() / ".streamlit" / "secrets.toml",
+            Path(os.getenv("USERPROFILE", "")) / ".streamlit" / "secrets.toml" if os.getenv("USERPROFILE") else None,
+        ]
+
+        for candidate in [path for path in candidate_paths if path is not None]:
+            try:
+                if candidate.exists() and candidate.stat().st_size > 0:
+                    with candidate.open("rb") as handle:
+                        parsed = tomllib.load(handle)
+                        if isinstance(parsed, dict):
+                            return parsed
+            except Exception:
+                continue
+        return {}
+
+    secret_password = ""
+    try:
+        scheduler_section = st.secrets.get("scheduler", {})
+        if isinstance(scheduler_section, dict):
+            secret_password = (
+                scheduler_section.get("REFRESH_PASSWORD")
+                or scheduler_section.get("refresh_password")
+                or ""
+            )
+    except Exception:
+        secret_password = ""
+
+    if not secret_password:
+        try:
+            secret_password = (
+                st.secrets.get("REFRESH_PASSWORD", "")
+                or st.secrets.get("refresh_password", "")
+                or st.secrets.get("REFRESH_DATA_PASSWORD", "")
+                or st.secrets.get("refresh_data_password", "")
+                or ""
+            )
+        except Exception:
+            secret_password = ""
+
+    if not secret_password:
+        file_secrets = _load_user_streamlit_secrets()
+        if isinstance(file_secrets, dict):
+            scheduler_section = file_secrets.get("scheduler", {})
+            if isinstance(scheduler_section, dict):
+                secret_password = (
+                    scheduler_section.get("REFRESH_PASSWORD")
+                    or scheduler_section.get("refresh_password")
+                    or ""
+                )
+
+            if not secret_password:
+                secret_password = (
+                    file_secrets.get("REFRESH_PASSWORD")
+                    or file_secrets.get("refresh_password")
+                    or file_secrets.get("REFRESH_DATA_PASSWORD")
+                    or file_secrets.get("refresh_data_password")
+                    or ""
+                )
+
+    if secret_password:
+        return str(secret_password).strip()
+
+    return str(
+        os.getenv("REFRESH_DATA_PASSWORD")
+        or os.getenv("REFRESH_PASSWORD")
+        or ""
+    ).strip()
+
+
+def _stop_pid(pid):
+    try:
+        if pid is None:
+            return False
+        pid_int = int(pid)
+    except Exception:
+        return False
+
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid_int), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        else:
+            os.kill(pid_int, signal.SIGTERM)
+        return not _is_pid_running(pid_int)
+    except Exception:
+        return False
+
+
+def _read_bot_logs_tail(max_lines=200, start_pos=0, forced_log_path=None):
+    chosen_log = None
+    if forced_log_path and os.path.exists(forced_log_path):
+        chosen_log = forced_log_path
+    else:
+        existing_logs = [path for path in _get_bot_log_candidates() if os.path.exists(path)]
+        if not existing_logs:
+            return "", None
+        chosen_log = max(existing_logs, key=lambda p: os.path.getmtime(p))
+
+    try:
+        with open(chosen_log, "r", encoding="utf-8", errors="ignore") as file_obj:
+            safe_start = max(0, int(start_pos or 0))
+            file_obj.seek(safe_start)
+            lines = file_obj.readlines()
+        return "".join(lines[-max_lines:]), chosen_log
+    except Exception as exc:
+        return f"Could not read log file: {exc}", chosen_log
+
+
+def _render_colored_log_html(logs_text):
+    lines = list(reversed(str(logs_text or "").splitlines()))
+    if not lines:
+        return (
+            "<div style='border:1px solid #D9E3EF;border-radius:10px;padding:12px;background:#FFFFFF;color:#64748B;'>"
+            "No logs available."
+            "</div>"
+        )
+
+    row_html = []
+    for raw_line in lines:
+        line_lower = raw_line.lower()
+        if "error" in line_lower:
+            bg, fg = "#7F1D1D", "#FECACA"
+        elif "warning" in line_lower:
+            bg, fg = "#FEE2E2", "#991B1B"
+        elif "info" in line_lower:
+            bg, fg = "#DCFCE7", "#166534"
+        else:
+            bg, fg = "#F8FAFC", "#334155"
+
+        row_html.append(
+            "<div style=\""
+            f"background:{bg};color:{fg};"
+            "padding:6px 8px;border-bottom:1px solid #E2E8F0;"
+            "font-family:Consolas, 'Courier New', monospace;font-size:12px;white-space:pre-wrap;"
+            "\">"
+            f"{escape(str(raw_line))}"
+            "</div>"
+        )
+
+    return (
+        "<div style='border:1px solid #D9E3EF;border-radius:10px;overflow:hidden;background:#FFFFFF;'>"
+        "<div style='max-height:480px;overflow:auto;'>"
+        + "".join(row_html)
+        + "</div></div>"
+    )
+
+
+@st.dialog("🤖 Bot Live Logs", width="large")
+def show_bot_logs_dialog(max_lines):
+    st.caption("Live logs while bot is running")
+
+    dialog_col1, dialog_col2 = st.columns([1, 1])
+    with dialog_col1:
+        auto_refresh = st.toggle("Auto Refresh", value=True, key="bot_dialog_auto_refresh")
+    with dialog_col2:
+        if st.button("🔄 Refresh", key="bot_dialog_refresh_btn"):
+            st.rerun()
+
+    logs_text, log_path = _read_bot_logs_tail(
+        max_lines=int(max_lines),
+        start_pos=st.session_state.get("bot_runner_log_start_pos", 0),
+        forced_log_path=st.session_state.get("bot_runner_log_path"),
+    )
+    if log_path:
+        st.caption(f"Log file: {log_path}")
+
+    st.markdown(_render_colored_log_html(logs_text), unsafe_allow_html=True)
+
+    if auto_refresh and _is_pid_running(st.session_state.get("bot_runner_pid")):
+        time.sleep(2)
+        st.rerun()
+
 def main():
     # Check authentication
     check_authentication()
@@ -5363,10 +5698,10 @@ def main():
         st.sidebar.caption(f"Could not fetch last update info: {exc}")
 
 
-    st.balloons()
+    # st.balloons()
     # Main content
     st.title(f"📊 Bazaar Prime Analytics Dashboard - {town}")
-    tab1,tab2,tab3,tab4,tab5=st.tabs(["📈 Sales Growth Analysis","🎯 Booker Performance","🧭 Booker & Field Force Deep Analysis","📦 Inventory","🧪 Custom Query"])
+    tab1,tab2,tab3,tab4,tab5,tab6=st.tabs(["📈 Sales Growth Analysis","🎯 Booker Performance","🧭 Booker & Field Force Deep Analysis","📦 Inventory","🧪 Custom Query","🤖 Bot Runner"])
     with tab1:
     # KPIs
         st.subheader("📈 Key Performance Indicator")
@@ -6975,7 +7310,9 @@ def main():
                     border: 1px solid #D9E3EF;
                     border-radius: 12px;
                     box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
-                    padding: 6px;
+                    padding: 0;
+                    box-sizing: border-box;
+                    overflow-x: hidden !important;
                 }
                 </style>
                 """,
@@ -7516,6 +7853,136 @@ def main():
                         )
                 except Exception as exc:
                     st.error(f"Query failed: {exc}")
+
+    with tab6:
+        st.subheader("🤖 Salesflo Bot Runner")
+        st.caption("Run Scrapper bot from dashboard and monitor logs.")
+
+        if "bot_runner_pid" not in st.session_state:
+            st.session_state["bot_runner_pid"] = None
+        if "bot_open_live_popup" not in st.session_state:
+            st.session_state["bot_open_live_popup"] = False
+        if "bot_runner_log_path" not in st.session_state:
+            st.session_state["bot_runner_log_path"] = _get_primary_bot_log_path()
+        if "bot_runner_log_start_pos" not in st.session_state:
+            st.session_state["bot_runner_log_start_pos"] = 0
+
+        current_pid = st.session_state.get("bot_runner_pid")
+        is_running = _is_pid_running(current_pid)
+        if not is_running and current_pid is not None:
+            st.session_state["bot_runner_pid"] = None
+
+        ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([1, 1, 1, 3])
+        with ctrl_col1:
+            if st.button("▶️ Start Bot", key="bot_runner_start_btn", type="primary"):
+                if is_running:
+                    st.warning(f"Bot is already running (PID: {current_pid}).")
+                    st.session_state["bot_open_live_popup"] = True
+                else:
+                    try:
+                        current_log_path = _get_primary_bot_log_path()
+                        current_log_start = _safe_file_size(current_log_path)
+                        new_pid = _start_bot_process()
+                        st.session_state["bot_runner_pid"] = int(new_pid)
+                        st.session_state["bot_runner_log_path"] = current_log_path
+                        st.session_state["bot_runner_log_start_pos"] = int(current_log_start)
+                        st.session_state["bot_open_live_popup"] = True
+                        st.success(f"Bot started successfully (PID: {new_pid}).")
+                    except Exception as bot_start_exc:
+                        st.error(f"Could not start bot: {bot_start_exc}")
+
+        with ctrl_col2:
+            if st.button("⏹ Stop Bot", key="bot_runner_stop_btn"):
+                active_pid = st.session_state.get("bot_runner_pid")
+                if _is_pid_running(active_pid):
+                    stopped = _stop_pid(active_pid)
+                    if stopped:
+                        st.session_state["bot_runner_pid"] = None
+                        st.session_state["bot_open_live_popup"] = False
+                        st.session_state["bot_runner_log_start_pos"] = 0
+                        st.success(f"Bot stopped (PID: {active_pid}).")
+                    else:
+                        st.error(f"Could not stop bot PID: {active_pid}")
+                else:
+                    st.info("Bot is not running.")
+
+        with ctrl_col3:
+            if st.button("🔄 Refresh Logs", key="bot_runner_refresh_btn"):
+                st.rerun()
+
+        with ctrl_col4:
+            if _is_pid_running(st.session_state.get("bot_runner_pid")):
+                st.success(f"Status: Running | PID: {st.session_state.get('bot_runner_pid')}")
+            else:
+                st.info("Status: Not Running")
+
+        st.markdown("### 🔄 Refresh Data (Selected Period)")
+        st.caption(f"Selected period: {start_date} to {end_date}")
+        refresh_col1, refresh_col2, refresh_col3 = st.columns([2, 1, 3])
+        with refresh_col1:
+            refresh_password_input = st.text_input(
+                "RefreshData Password",
+                type="password",
+                key="bot_refresh_data_password_input",
+                help="Required to run refresh for selected period."
+            )
+        with refresh_col2:
+            st.markdown("<div style='height: 1.85rem;'></div>", unsafe_allow_html=True)
+            if st.button("🔁 RefreshData", key="bot_refresh_data_btn"):
+                if _is_pid_running(st.session_state.get("bot_runner_pid")):
+                    st.warning("Bot is already running. Stop it first, then run RefreshData.")
+                else:
+                    expected_password = _get_refresh_data_password()
+                    if not expected_password:
+                        st.error("Refresh password is not configured. Set REFRESH_DATA_PASSWORD in secrets or environment.")
+                    elif str(refresh_password_input or "") != expected_password:
+                        st.error("Invalid refresh password.")
+                    else:
+                        try:
+                            current_log_path = _get_primary_bot_log_path()
+                            current_log_start = _safe_file_size(current_log_path)
+                            new_pid = _start_bot_process(
+                                extra_env={
+                                    "FORCE_START_DATE": str(start_date),
+                                    "FORCE_END_DATE": str(end_date),
+                                }
+                            )
+                            st.session_state["bot_runner_pid"] = int(new_pid)
+                            st.session_state["bot_runner_log_path"] = current_log_path
+                            st.session_state["bot_runner_log_start_pos"] = int(current_log_start)
+                            st.session_state["bot_open_live_popup"] = True
+                            st.success(f"RefreshData started for {start_date} to {end_date} (PID: {new_pid}).")
+                        except Exception as refresh_exc:
+                            st.error(f"Could not start RefreshData: {refresh_exc}")
+        with refresh_col3:
+            st.caption("Runs bot for only selected period and updates DB rows for that range.")
+
+        lines_to_show = st.slider(
+            "Log lines",
+            min_value=50,
+            max_value=1000,
+            value=250,
+            step=50,
+            key="bot_runner_log_lines"
+        )
+
+        logs_text, log_path = _read_bot_logs_tail(
+            max_lines=int(lines_to_show),
+            start_pos=st.session_state.get("bot_runner_log_start_pos", 0),
+            forced_log_path=st.session_state.get("bot_runner_log_path"),
+        )
+        if log_path:
+            st.caption(f"Log file: {log_path}")
+        else:
+            st.caption("Log file not found yet. Start the bot to generate logs.")
+
+        st.markdown(_render_colored_log_html(logs_text), unsafe_allow_html=True)
+
+        if st.button("📺 Open Live Log Popup", key="bot_runner_open_popup_btn"):
+            st.session_state["bot_open_live_popup"] = True
+
+        if _is_pid_running(st.session_state.get("bot_runner_pid")) and st.session_state.get("bot_open_live_popup"):
+            show_bot_logs_dialog(lines_to_show)
 
     st.markdown("---")
     st.markdown("© 2026 Bazaar Prime Analytics Dashboard | Powered by Streamlit")

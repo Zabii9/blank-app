@@ -1,248 +1,259 @@
 # Bazaar Prime Analytics — End User Guide
 
-This guide explains all dashboard features for business users.
+This guide explains the latest dashboard behavior, filters, and calculation logic for all reports.
 
-## 1) Access & Login
+## 1) Access
 
-- Open the app URL shared by your admin.
-- Enter username/password on the login screen.
-- After login, your username appears in the sidebar.
-- Use **Logout** from sidebar any time.
+- Open the Streamlit app URL provided by your admin.
+- Login with your assigned username/password.
+- Use Logout from sidebar when needed.
 
-## 2) Global Controls (Apply across dashboard)
+---
 
-### Sidebar: Period
-Choose one of:
+## 2) Global Filters (Apply across tabs)
+
+### Date / Period filter
+Available options:
 - Last 7 Days
 - Last 30 Days
 - This Month
 - Last Month
 - Last 3 Months
 - YTD
-- Custom (manual start/end dates)
+- Custom Range
 
-### Sidebar: Location
-Select city/distributor:
+### Account / Location filter
+Distributor selection (example mappings):
 - Karachi (`D70002202`)
 - Lahore (`D70002246`)
 
-> Tip: Change period/location first, then analyze any tab.
-
-## 3) Tab Overview
-
-The app has 4 tabs:
-1. **📈 Sales Growth Analysis**
-2. **🎯 Booker Performance**
-3. **🧭 Booker & Field Force Deep Analysis**
-4. **🧪 Custom Query**
+### How period comparison works
+- KPI deltas compare against a prior base period (previous month / previous year / previous snapshot depending on metric).
+- If comparison base is missing, delta may show `-`.
 
 ---
 
-## 4) Tab 1 — Sales Growth Analysis
+## 3) Tab Structure (Current)
 
-### A) KPI Cards
-Top KPI cards show:
-- Total Revenue
-- Total Litres
-- Total Orders
-- Avg Order Value (AOV)
-
-Each KPI includes comparison vs:
-- Last Year
-- Last Month
-
-### B) Channel-wise AOV Cards
-- Channel-level AOV cards
-- Growth vs last year/month
-
-### C) Channel Performance Charts
-- Channel-wise performance comparison (Value/Ltr toggle)
-- Channel-wise growth chart (Value/Ltr toggle)
-
-### D) Brand & Deliveryman Growth
-- Brand-wise growth percentage (Value/Ltr toggle)
-- Deliveryman-wise growth percentage (Value/Ltr toggle)
-
-### E) Targets & Achievement
-- Target vs Achievement comparison (Value/Ltr)
-- Booker/period target achievement heatmap
-- Channel heatmap panel
-
-### F) Sunburst + Productivity
-- Channel/Brand/DM sunburst chart
-- Brand productivity companion chart
-- DM/channel filters
-
-### G) Booker Less-Than-Half-Carton Analysis
-- Period selector (last 1–4 months)
-- Summary table by booker/brand
-- Optional drill-down detail table
-
-### H) MOPU & Drop Size Analysis
-- Combined chart for:
-  - Total Orders
-  - Drop Size
-  - SKU per Bill
-  - MOPU
+1. 📈 Sales Growth Analysis  
+2. 🎯 Booker Performance  
+3. 🧭 Booker & Field Force Deep Analysis  
+4. 📦 Inventory  
+5. 🧪 Custom Query Runner
 
 ---
 
-## 5) Tab 2 — Booker Performance
+## 4) Filters by Report Area
 
-### A) Booker Treemap Controls
-- Period selector (based on available data)
+## Tab 1 — Sales Growth Analysis
+
+Common controls in this tab:
+- Value vs Litre basis toggles on growth/performance visuals
+- Channel filters (where applicable)
+- Brand/DM drill controls in hierarchical charts
+
+What filters affect:
+- Most charts respect global period + account.
+- Additional local controls (channel, basis, brand) apply only to the relevant chart section.
+
+## Tab 2 — Booker Performance
+
+Common controls:
+- Period selector (available periods)
 - Channel filter
-- Achievement filter (All / Below 50/60/70)
-- Brand multi-filter
+- Achievement cutoff filters
+- Brand multiselect
+- Flow direction and Top/Bottom controls in Sankey
 
-### B) Treemaps
-- Booker-level treemap
-- Brand→Booker treemap
+What filters affect:
+- Treemap/Sankey/heatmaps respect global period + account, plus local controls.
 
-### C) OB/Brand Sankey
-- Flow direction toggle:
-  - OB → Brand
-  - Brand → OB
-- Top N / Bottom N controls
-- Split layout / force-left layout toggles
+## Tab 3 — Booker & Field Force Deep Analysis
 
-### D) Booker GMV Calendar Heatmap
-- Month window (3/6/12 months)
-- Booker filter
-- Daily GMV/order intensity view
-
----
-
-## 6) Tab 3 — Booker & Field Force Deep Analysis
-
-### A) Deep Filters
+Common controls:
 - Booker multiselect
 - Channel multiselect
+- Additional local chart/table controls (where shown)
 
-### B) Performance Charts
-- Route-wise achieved vs target
-- Daily sales & orders trend
-- Daily calls trend (with fallback to latest visit data if needed)
+What filters affect:
+- Route, calls, cohort, segmentation, scoring, and leaderboard modules use global filters plus their local selectors.
 
-### C) Customer Activity Insights
-- Weekly cohort retention heatmap
-- Segmentation donut:
-  - Power Users
-  - Regular
-  - Occasional
-  - Dormant
-- Booker-wise segmentation stacked chart
-- Right-side segmentation table with table-only filters
+## Tab 4 — Inventory
 
-### D) Brand Focus / Scoring
-- **Booker Brand-Level Scoring**
-- Top/Bottom brand by booker table
-- Selected booker brand score detail chart
-- Low-focus threshold slider
-- Booker-wise low-focus brand summary with color chips
+Common controls:
+- Global period + account (required)
+- Stock Cover Bucket Settings (B1..B5) for matrix bucketing
 
-### E) KPI Blocks (Unified card style)
-**Calls KPIs**:
-- Avg Strike Rate
-- Avg Calls/Day
-- Productive Calls %
-- SKU/Bill
-- Total Visits
+What filters affect:
+- Inventory KPIs, trend charts, and health metrics use latest available stock snapshot up to selected end date.
+- Sales-linked inventory logic uses trailing windows (mostly 30-day and 90-day).
+- Bucket settings affect only the Stock Cover Days matrix.
 
-**Summary KPIs**:
-- Active Bookers
-- Total NMV
-- Total Orders
-- Avg AOV
+## Tab 5 — Custom Query Runner
 
-### F) Leaderboard
-- Top 5 / Bottom 5 performers
-- Weighted performance score shown in tooltip logic
+Controls:
+- SQL editor
+- Sample query loader
+- Schema browser + column search
+
+Rules:
+- Only single read-only `SELECT` statement allowed.
+- Mutating operations are blocked.
 
 ---
 
-## 7) Tab 4 — Custom Query (Read-only SQL)
+## 5) Core Metric Logic (Business Definitions)
 
-This tab is for business users who need ad-hoc analysis.
+## A) Sales / Order KPIs
 
-### A) Saved Sample Queries
-- Prebuilt examples (Booker-wise NMV, Brand sales, Daily trend, Top outlets)
-- Use **Load Sample** to fill SQL editor
+- **Revenue** = `SUM(Delivered Amount + Total Discount)`
+- **Orders** = distinct invoice count
+- **AOV** = `Revenue / Orders`
 
-### B) Table & Column Structure Browser
-- Expand **Table & Column Structure**
-- Search table/column by keyword
-- Select a table to see all columns + data types
-- Interactive column selection helps build SQL quickly
+## B) Inventory KPI Cards
 
-### C) Fast Query Builder Helpers
-- **Insert Table Name** button
-- Multi-select columns in table grid auto-builds query:
-  - `SELECT col1, col2 ... FROM table LIMIT 100`
-- Search-match grid can also inject selected columns
+- **Current Inventory**  
+  Latest stock snapshot total value (YTD month-end sparkline shows last stock day of each month).
 
-### D) Query Validation & Security Rules
-Only read-only SQL is allowed.
+- **Total SKUs**  
+  Distinct SKU count in current stock snapshot.
+
+- **In-Stock Rate (%)**  
+  `In-stock SKUs / Total SKUs × 100`
+
+- **OOS SKUs**  
+  SKU count where stock value <= 0.
+
+- **Avg Days Cover** (weighted by SKU contribution; 90-day basis)  
+  For each SKU:  
+  `days_cover_i = stock_i / (sales90_i / 90)`  
+  `contribution_i = sales90_i / total_sales90`  
+  Final:  
+  `Avg Days Cover = Σ(days_cover_i × contribution_i)`
+
+- **Slow Movers**  
+  SKUs where `stock > 0` and `sales_30 <= 0`.
+
+## C) Inventory Trend Charts
+
+- **Stock Movement Trend (30 days)**
+  - Inflow = positive day-over-day stock increase
+  - Outflow = daily delivered sales value
+
+- **Days Cover by Category**
+  - Category cover days = `Category Stock / (Category Sales30 / 30)`
+  - Visual thresholds:
+    - Red: `<7`
+    - Amber: `7–14`
+    - Green: `>14`
+
+## D) Stock Cover Days Matrix (as per Salesflo)
+
+For each SKU:
+- `cover_days = stock_value / (sales90 / 90)` when `sales90 > 0`
+- `cover_days = ∞` when `sales90 = 0` (goes to Zero Sale)
+
+Bucket columns are dynamic using B1..B5:
+- `Inventory <B1`
+- `Inventory B1-B2`
+- `Inventory B2-B3`
+- `Inventory B3-B4`
+- `Inventory B4-B5`
+- `Inventory B5+`
+- `Zero Sale`
+
+Matrix rules:
+- Rows are account-wise (no total row).
+- Top percentage row = each bucket share of total inventory across displayed accounts.
+
+## E) Inventory Health
+
+- **Inventory Turnover**  
+  `Sales_90 / Avg_Stock_90`
+
+- **Dead Stock Value**  
+  Sum of SKU stock where:
+  - sales contribution in 90-day sales `< 2%`, and
+  - cover days `> 25`
+
+- **Wastage Rate (%)**  
+  `Dead Stock Value / Total Current Stock × 100`
+
+- **Avg Replenishment Cycle (days)**  
+  Average gap between positive stock refill events.
+
+- **GMROII (proxy)**  
+  `Sales_30 / Avg_Stock_30`
+
+- **Safety Stock Coverage (days)**  
+  `Total Stock / (Sales_30 / 30)`
+
+- **Dead Stock SKU-wise Detail**
+  Includes SKU Name, Stock Value, Sales 90D, Sales Contribution %, Cover Days.
+
+---
+
+## 6) Custom Query Logic
 
 Allowed:
-- Single `SELECT` statement
+- One `SELECT` query only
 
 Blocked:
-- `UPDATE`, `DELETE`, `INSERT`, `DROP`, `ALTER`, `TRUNCATE`, `CREATE`, etc.
-- Multiple statements in one run
+- `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `TRUNCATE`, `CREATE`, multi-statement scripts
 
-### E) Output & Download
-- Result preview table
-- Row count success message
-- CSV download for preview rows
+Output:
+- Preview table + CSV download
 
 ---
 
-## 8) How to Use (Recommended Workflow)
+## 7) Reading Deltas Correctly
 
-1. Select **Period** and **Location** from sidebar.
-2. Review high-level KPIs in Tab 1.
-3. Deep-dive booker behavior in Tab 2 and Tab 3.
-4. Use Tab 4 for custom SQL questions.
-5. Export preview data as CSV when needed.
+- Arrow/Color indicates movement vs comparison base.
+- Some KPIs use inverted-good logic (example: OOS lower is better).
+- If base period has no data, delta may be neutral/blank.
 
 ---
 
-## 9) Common Tips
+## 8) Troubleshooting
 
-- If a chart is empty, first check filters (date/booker/channel).
-- For table-only filters (in some sections), those filters affect only that table.
-- Hover tooltips on charts/chips for exact values and definitions.
-- In Custom Query, start from a sample query and then edit.
+### No data shown
+- Expand period range.
+- Verify account filter.
+- Clear local filters in tab section.
 
----
+### Inventory values look unusually high/low
+- Check selected account and end date.
+- Check bucket settings (B1..B5) for matrix interpretation.
 
-## 10) Common Errors & Fixes
-
-### "No data available"
-- Relax filters (wider date range, remove strict channel/booker filters).
-
-### "Only SELECT queries are allowed"
-- Rewrite query as a single `SELECT` statement.
-
-### Query failed
-- Verify table/column names from the structure browser.
-- Remove unsupported SQL syntax for current database.
+### Custom Query blocked
+- Ensure query is a single read-only `SELECT`.
 
 ---
 
-## 11) Data Notes
+## 9) Support Checklist
 
-- Metrics are computed from backend transactional/target tables configured by admin.
-- Some comparisons use prior period windows (last month/year or previous date window).
-- KPI/leaderboard calculations are automated in app logic.
+When reporting an issue, share:
+- Selected period
+- Selected account/distributor
+- Tab and report section name
+- Screenshot
+- If SQL related: the exact query used
 
 ---
 
-## 12) Support
+## 10) Business Glossary
 
-For access issues, data mismatches, or new feature requests, contact your dashboard admin/analytics team and share:
-- selected period
-- selected location
-- tab name
-- screenshot/query used
+- **AOV (Average Order Value)**: Average value per invoice (`Revenue / Orders`).
+- **Cover Days**: Estimated days current stock can sustain at recent average daily sales.
+- **Dead Stock**: Low-contribution SKUs (`<2%` of 90-day sales) with high cover (`>25 days`).
+- **GMROII (Proxy)**: Return-on-inventory proxy using sales and average stock for recent period.
+- **In-Stock Rate**: Share of SKUs with positive stock.
+- **Inventory Turnover**: How fast inventory converts into sales (`Sales_90 / Avg_Stock_90`).
+- **OOS (Out of Stock)**: SKUs with stock value less than or equal to zero.
+- **Par Level Inventory**: Target inventory level based on desired cover days and daily sales run-rate.
+- **Productive Calls**: Planned calls that converted into productive outcomes as per visit logic.
+- **Safety Stock Coverage**: Buffer days available from current stock at 30-day average sales rate.
+- **Sales Contribution %**: SKU share of total sales in the selected lookback window.
+- **Slow Movers**: SKUs in stock but with no sales in last 30 days.
+- **Stock Snapshot**: Latest available stock state (value/units) on a specific report date.
+- **YTD (Year to Date)**: Period from start of current year to selected end date.

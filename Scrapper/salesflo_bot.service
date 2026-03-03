@@ -1,0 +1,16 @@
+[Unit]
+Description=Salesflo End Stock Summary Bot
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_LINUX_USER
+WorkingDirectory=/path/to/salesflo_bot
+ExecStart=/path/to/salesflo_bot/venv/bin/python bot.py
+Restart=on-failure
+RestartSec=60
+StandardOutput=append:/var/log/salesflo_bot.log
+StandardError=append:/var/log/salesflo_bot.log
+
+[Install]
+WantedBy=multi-user.target

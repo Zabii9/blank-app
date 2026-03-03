@@ -7,3 +7,10 @@ sqlalchemy
 pymysql
 gunicorn
 dotenv
+playwright
+aiomysql
+schedule
+python-dotenv
+openpyxl
+xlrd
+tomli
