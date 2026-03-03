@@ -46,7 +46,7 @@ USERNAME_2 = os.getenv("SALESFLO_USERNAME2") or os.getenv("SALESFLO_USERNAME_2",
 PASSWORD_2 = os.getenv("SALESFLO_PASSWORD2") or os.getenv("SALESFLO_PASSWORD_2", "")
 
 DB_HOST  = os.getenv("DB_HOST", "your-mysql-host")
-DB_PORT  = int(os.getenv("DB_PORT", "3306"))
+DB_PORT = int(os.getenv("DB_PORT") or 3306)
 DB_USER  = os.getenv("DB_USER", "your-db-user")
 DB_PASS  = os.getenv("DB_PASS", "your-db-password")
 DB_NAME  = os.getenv("DB_NAME", "salesflo_data")
