@@ -28,11 +28,11 @@ jobs:
 
       - name: Run Scraper
         env:
-          host: ${{ secrets.host }}
-          database: ${{ secrets.database }}
-          username: ${{ secrets.username }}
-          password: ${{ secrets.password }}
-          port: ${{ secrets.port }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          DB_NAME: ${{ secrets.DB_NAME }}
           SALESFLO_USERNAME: ${{ secrets.SALESFLO_USERNAME }}
           SALESFLO_PASSWORD: ${{ secrets.SALESFLO_PASSWORD }}
           SALESFLO_USERNAME2: ${{ secrets.SALESFLO_USERNAME2 }}
