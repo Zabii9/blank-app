@@ -5381,19 +5381,25 @@ def _start_bot_process(extra_env=None):
 
     with open(log_path, "a", encoding="utf-8") as log_file:
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        if os.name == "nt":
+            creation_flags = creation_flags | subprocess.CREATE_NEW_PROCESS_GROUP
         process_env = os.environ.copy()
         if isinstance(extra_env, dict):
             for key, value in extra_env.items():
                 if value is not None:
                     process_env[str(key)] = str(value)
-        process = subprocess.Popen(
-            [sys.executable, bot_script],
-            cwd=os.path.dirname(__file__),
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            creationflags=creation_flags,
-            env=process_env,
-        )
+        popen_kwargs = {
+            "args": [sys.executable, bot_script],
+            "cwd": os.path.dirname(__file__),
+            "stdout": log_file,
+            "stderr": subprocess.STDOUT,
+            "creationflags": creation_flags,
+            "env": process_env,
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+
+        process = subprocess.Popen(**popen_kwargs)
     return process.pid
 
 
@@ -5594,8 +5600,34 @@ def _stop_pid(pid):
                 text=True,
                 check=False,
             )
+            for _ in range(20):
+                if not _is_pid_running(pid_int):
+                    return True
+                time.sleep(0.1)
         else:
-            os.kill(pid_int, signal.SIGTERM)
+            try:
+                os.killpg(pid_int, signal.SIGTERM)
+            except Exception:
+                os.kill(pid_int, signal.SIGTERM)
+
+            for _ in range(20):
+                if not _is_pid_running(pid_int):
+                    return True
+                time.sleep(0.1)
+
+            try:
+                os.killpg(pid_int, signal.SIGKILL)
+            except Exception:
+                try:
+                    os.kill(pid_int, signal.SIGKILL)
+                except Exception:
+                    pass
+
+            for _ in range(20):
+                if not _is_pid_running(pid_int):
+                    return True
+                time.sleep(0.1)
+
         return not _is_pid_running(pid_int)
     except Exception:
         return False
