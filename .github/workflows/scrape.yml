@@ -28,14 +28,14 @@ jobs:
 
       - name: Run Scraper
         env:
-          host: ${{ PRIME.host }}
-          database: ${{ PRIME.database }}
-          username: ${{ PRIME.username }}
-          password: ${{ PRIME.password }}
-          port: ${{ PRIME.port }}
-          SALESFLO_USERNAME: ${{ PRIME.SALESFLO_USERNAME }}
-          SALESFLO_PASSWORD: ${{ PRIME.SALESFLO_PASSWORD }}
-          SALESFLO_USERNAME2: ${{ PRIME.SALESFLO_USERNAME2 }}
-          SALESFLO_PASSWORD2: ${{ PRIME.SALESFLO_PASSWORD2 }}
+          host: ${{ secrets.host }}
+          database: ${{ secrets.database }}
+          username: ${{ secrets.username }}
+          password: ${{ secrets.password }}
+          port: ${{ secrets.port }}
+          SALESFLO_USERNAME: ${{ secrets.SALESFLO_USERNAME }}
+          SALESFLO_PASSWORD: ${{ secrets.SALESFLO_PASSWORD }}
+          SALESFLO_USERNAME2: ${{ secrets.SALESFLO_USERNAME2 }}
+          SALESFLO_PASSWORD2: ${{ secrets.SALESFLO_PASSWORD2 }}
         run: |
           Scrapper/bot.py
