@@ -11,6 +11,7 @@ from sqlalchemy import create_engine
 from functools import lru_cache
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 from datetime import datetime, timedelta
 import numpy as np
 import os
@@ -22,6 +23,116 @@ import signal
 from pathlib import Path
 from dotenv import load_dotenv
 from html import escape
+from urllib.parse import quote
+import base64
+import hmac
+import hashlib
+
+# ======================
+# 🎨 CHART THEME COLORS
+# ======================
+# Update values here to change chart colors app-wide.
+CHART_COLORS = {
+    "primary": "#5B5F97",
+    "secondary": "#B8B8D1",
+    "accent": "#FFC145",
+    "danger": "#FF6B6C",
+    "success": "#16A34A",
+    "warning": "#D97706",
+    "info": "#2563EB",
+    "neutral": "#94A3B8",
+    "target": "#6B7280",
+    "text_dark": "#111827",
+    "text_light": "#F8FAFC",
+    "text_muted": "#64748B",
+    "surface": "#FFFFFF",
+    "surface_soft": "#F8FAFC",
+    "border": "#D9E3EF",
+    "grid": "#E2E8F0",
+    "zero_line": "#CBD5E1",
+    "brand_grad_start": "#06B6D4",
+    "brand_grad_end": "#38BDF8",
+    "transparent": "rgba(0,0,0,0)",
+}
+
+ACHIEVEMENT_BAND_COLORS = {
+    "lt_50": "#EF4444",
+    "50_60": "#F97316",
+    "60_70": "#FACC15",
+    "gte_70": "#22C55E",
+}
+
+CHART_PALETTE_BASE = [
+    CHART_COLORS["accent"],
+    CHART_COLORS["primary"],
+    CHART_COLORS["secondary"],
+    "#FFFFFB",
+    CHART_COLORS["danger"],
+]
+
+COLOR_ALIAS_MAP = {
+    "#5B5F97": "primary",
+    "#B8B8D1": "secondary",
+    "#FFC145": "accent",
+    "#F2C30A": "accent",
+    "#FF6B6C": "danger",
+    "#DC2626": "danger",
+    "#16A34A": "success",
+    "#22C55E": "success",
+    "#D97706": "warning",
+    "#F59E0B": "warning",
+    "#2563EB": "info",
+    "#94A3B8": "neutral",
+    "#6B7280": "target",
+    "#111827": "text_dark",
+    "#F8FAFC": "text_light",
+    "#64748B": "text_muted",
+    "#D9E3EF": "border",
+    "#06B6D4": "brand_grad_start",
+    "#38BDF8": "brand_grad_end",
+    "rgba(0,0,0,0)": "transparent",
+}
+
+def resolve_chart_color(color_value):
+    """Resolve hardcoded chart colors to centralized CHART_COLORS palette."""
+    if not isinstance(color_value, str):
+        return color_value
+    mapped_key = COLOR_ALIAS_MAP.get(color_value)
+    if mapped_key:
+        return CHART_COLORS.get(mapped_key, color_value)
+    return color_value
+
+def _remap_colors_recursive(payload):
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if isinstance(value, str) and "color" in str(key).lower():
+                payload[key] = resolve_chart_color(value)
+            else:
+                _remap_colors_recursive(value)
+    elif isinstance(payload, list):
+        for idx, item in enumerate(payload):
+            if isinstance(item, str):
+                payload[idx] = resolve_chart_color(item)
+            else:
+                _remap_colors_recursive(item)
+
+def apply_central_chart_palette(fig):
+    """Apply centralized color remapping to a Plotly figure."""
+    if fig is None:
+        return fig
+    fig_dict = fig.to_dict()
+    _remap_colors_recursive(fig_dict)
+    return go.Figure(fig_dict)
+
+pio.templates["bazaarprime"] = go.layout.Template(
+    layout=dict(
+        colorway=CHART_PALETTE_BASE,
+        paper_bgcolor=CHART_COLORS["transparent"],
+        plot_bgcolor=CHART_COLORS["transparent"],
+        font=dict(color=CHART_COLORS["text_dark"]),
+    )
+)
+pio.templates.default = "bazaarprime"
 
 try:
     import tomllib  # Python 3.11+
@@ -49,6 +160,48 @@ VALID_USERS = {
     "viewer": "viewer123",
 }
 
+def _get_link_auth_secret():
+    return (
+        st.secrets.get("LINK_AUTH_SECRET", "")
+        or os.getenv("LINK_AUTH_SECRET", "")
+        or "bazaarprime-link-secret"
+    )
+
+def create_link_auth_token(username, ttl_seconds=7200):
+    """Create signed token to auto-authenticate deep-link pages in new tabs."""
+    safe_username = str(username or "").strip()
+    if not safe_username:
+        return ""
+    exp = int(time.time()) + int(ttl_seconds)
+    payload = f"{safe_username}|{exp}"
+    sig = hmac.new(
+        _get_link_auth_secret().encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    token = base64.urlsafe_b64encode(f"{payload}|{sig}".encode("utf-8")).decode("utf-8")
+    return token
+
+def parse_link_auth_token(token):
+    """Validate signed token and return username if valid."""
+    try:
+        raw = base64.urlsafe_b64decode(str(token).encode("utf-8")).decode("utf-8")
+        username, exp_raw, sig = raw.split("|", 2)
+        exp = int(exp_raw)
+        if exp < int(time.time()):
+            return None
+        payload = f"{username}|{exp}"
+        expected_sig = hmac.new(
+            _get_link_auth_secret().encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return None
+        return username if username in VALID_USERS else None
+    except Exception:
+        return None
+
 def check_authentication():
     """Check if user is authenticated"""
     # Initialize session state variables
@@ -56,6 +209,15 @@ def check_authentication():
         st.session_state.authenticated = False
     if "username" not in st.session_state:
         st.session_state.username = None
+    if "post_login_query_params" not in st.session_state:
+        st.session_state.post_login_query_params = None
+
+    if not st.session_state.authenticated:
+        token_username = parse_link_auth_token(st.query_params.get("auth_token", ""))
+        if token_username:
+            st.session_state.authenticated = True
+            st.session_state.username = token_username
+            return
     
     if not st.session_state.authenticated:
         st.title("🔐 Login")
@@ -64,8 +226,18 @@ def check_authentication():
         
         if st.button("Login"):
             if username in VALID_USERS and VALID_USERS[username] == password:
+                qp_snapshot = {}
+                try:
+                    for key in ["view", "booker", "start", "end", "town"]:
+                        value = st.query_params.get(key)
+                        if value not in (None, ""):
+                            qp_snapshot[key] = str(value)
+                except Exception:
+                    qp_snapshot = {}
+
                 st.session_state.authenticated = True
                 st.session_state.username = username
+                st.session_state.post_login_query_params = qp_snapshot or None
                 
                 st.rerun()
                 
@@ -428,15 +600,16 @@ def fetch_inventory_kpi_data(end_date, town_code):
 
 
 @st.cache_data(ttl=1800)
-def fetch_inventory_ytd_month_end_sparkline(end_date, town_code):
-    """Fetch YTD month-end inventory values for sparkline in Inventory tab."""
+def fetch_inventory_last_12_month_end_sparkline(end_date, town_code):
+    """Fetch last 12 month-end inventory values for sparkline in Inventory tab."""
     end_ts = pd.to_datetime(end_date, errors='coerce')
     if pd.isna(end_ts):
         return []
 
     end_day = pd.Timestamp(end_ts).date()
-    year_start = pd.Timestamp(end_ts).replace(month=1, day=1).date()
     end_month_start = pd.Timestamp(end_ts).replace(day=1)
+    start_month_start = (end_month_start - pd.DateOffset(months=11)).normalize()
+    start_day = pd.Timestamp(start_month_start).date()
 
     query = f"""
     SELECT
@@ -449,7 +622,8 @@ def fetch_inventory_ytd_month_end_sparkline(end_date, town_code):
         FROM end_stock_summary
         WHERE distributor_code = '{town_code}'
           AND LOWER(COALESCE(unit, '')) = 'value'
-          AND report_date BETWEEN '{year_start}' AND '{end_day}'
+                    AND report_date BETWEEN '{start_day}' AND '{end_day}'
+                    AND report_date = LAST_DAY(report_date)
         GROUP BY DATE_FORMAT(report_date, '%%Y-%%m-01')
     ) m
     INNER JOIN end_stock_summary s
@@ -461,7 +635,7 @@ def fetch_inventory_ytd_month_end_sparkline(end_date, town_code):
     """
 
     spark_df = read_sql_cached(query, "db42280")
-    month_range = pd.date_range(start=pd.Timestamp(year_start), end=end_month_start, freq='MS')
+    month_range = pd.date_range(start=start_month_start, end=end_month_start, freq='MS')
     month_df = pd.DataFrame({'Month_Start': month_range})
 
     if spark_df is None or spark_df.empty:
@@ -997,7 +1171,7 @@ def fetch_table_structure_data():
 # ======================
 
 @st.cache_data(ttl=3600)
-def fetch_booker_less_ctn_data(months_back=3, town="db42280"):
+def fetch_booker_less_ctn_data(months_back=3,town_code=None):
     """Fetch booker less than half carton data"""
     eng = get_engine()
     
@@ -1015,13 +1189,16 @@ WITH ContinuousDeliveries AS (
         m.`UOM`,
         ROW_NUMBER() OVER (PARTITION BY o.`Store Code`, m.brand ORDER BY o.`Delivery Date` ASC) AS RowNum,
         COUNT(*) OVER (PARTITION BY o.`Store Code`, m.brand) AS TotalDeliveries,
-        CASE WHEN (o.`Delivered Units` / m.`UOM`) < 0.5 THEN 1 ELSE 0 END AS LessThanHalfCtn
+        CASE WHEN (o.`Delivered Units` / m.`UOM`) < 0.5 THEN 1 ELSE 0 END AS LessThanHalfCtn,
+        CASE WHEN o.`Distributor Code`='D70002202' THEN 'Karachi'
+             WHEN o.`Distributor Code`='D70002246' THEN 'Lahore' ELSE 'CBL' END AS Town
     FROM
         (SELECT * FROM ordered_vs_delivered_rows WHERE `Delivered Units` > 0) o
     LEFT JOIN
         sku_master m ON m.`Sku_Code` = o.`SKU Code`
     WHERE
         o.`Delivery Date` >= DATE_SUB(CURDATE(), INTERVAL {months_back} MONTH)
+        and o.`Distributor Code` ='{town_code}'
 ),
 final AS (
     SELECT
@@ -1542,6 +1719,77 @@ ORDER BY
     return read_sql_cached(query, db_name)
 
 @st.cache_data(ttl=3600)
+def dm_wise_unique_productivity_growth_data(start, end, town_code):
+    """Fetch DM-wise unique productive shops for current period vs LY/LM comparisons."""
+    db_name = "db42280"
+
+    query = f"""
+    WITH raw AS (
+        SELECT
+            o.`Deliveryman Name` AS DeliveryMan,
+            TRIM(o.`Store Code`) AS Store_Code,
+            DATE(o.`Delivery Date`) AS D_Date,
+            CASE
+                WHEN o.`Distributor Code`='D70002202' THEN 'Karachi'
+                WHEN o.`Distributor Code`='D70002246' THEN 'Lahore'
+                ELSE 'CBL'
+            END AS Town
+        FROM ordered_vs_delivered_rows o
+        WHERE o.`Distributor Code` = '{town_code}'
+          AND o.`Deliveryman Name` IS NOT NULL
+          AND TRIM(o.`Deliveryman Name`) <> ''
+          AND o.`Store Code` IS NOT NULL
+          AND TRIM(o.`Store Code`) <> ''
+        GROUP BY
+            o.`Deliveryman Name`,
+            TRIM(o.`Store Code`),
+            DATE(o.`Delivery Date`),
+            o.`Distributor Code`
+    ),
+    selected_period AS (
+        SELECT
+            Town,
+            DeliveryMan,
+            COUNT(DISTINCT Store_Code) AS Current_Unique_Productive
+        FROM raw
+        WHERE D_Date BETWEEN '{start}' AND '{end}'
+        GROUP BY Town, DeliveryMan
+    ),
+    last_year_period AS (
+        SELECT
+            Town,
+            DeliveryMan,
+            COUNT(DISTINCT Store_Code) AS Last_Year_Unique_Productive
+        FROM raw
+        WHERE D_Date BETWEEN DATE_SUB('{start}', INTERVAL 1 YEAR) AND DATE_SUB('{end}', INTERVAL 1 YEAR)
+        GROUP BY Town, DeliveryMan
+    ),
+    last_month_period AS (
+        SELECT
+            Town,
+            DeliveryMan,
+            COUNT(DISTINCT Store_Code) AS Last_Month_Unique_Productive
+        FROM raw
+        WHERE D_Date BETWEEN DATE_SUB('{start}', INTERVAL 1 MONTH) AND DATE_SUB('{end}', INTERVAL 1 MONTH)
+        GROUP BY Town, DeliveryMan
+    )
+    SELECT
+        sp.Town,
+        sp.DeliveryMan,
+        COALESCE(sp.Current_Unique_Productive, 0) AS Current_Unique_Productive,
+        COALESCE(ly.Last_Year_Unique_Productive, 0) AS Last_Year_Unique_Productive,
+        COALESCE(lm.Last_Month_Unique_Productive, 0) AS Last_Month_Unique_Productive
+    FROM selected_period sp
+    LEFT JOIN last_year_period ly
+        ON sp.Town = ly.Town AND sp.DeliveryMan = ly.DeliveryMan
+    LEFT JOIN last_month_period lm
+        ON sp.Town = lm.Town AND sp.DeliveryMan = lm.DeliveryMan
+    ORDER BY sp.DeliveryMan;
+    """
+
+    return read_sql_cached(query, db_name)
+
+@st.cache_data(ttl=3600)
 def tgtvsach_YTD_data(town_code):
     """Fetch target vs achievement YTD data for comparison charts"""
     db_name = "db42280"
@@ -1565,7 +1813,7 @@ Case when o.`Distributor Code`='D70002202' then 'Karachi'
 where o.`Distributor Code` = '{town_code}'
  GROUP BY MONTH(`Delivery Date`),YEAR(`Delivery Date`),Town
 order by YEAR(`Delivery Date`) desc,MONTH(`Delivery Date`) desc
- limit 14
+ limit 10
 
 
 """
@@ -1916,6 +2164,31 @@ def fetch_daily_calls_trend_data(start_date, end_date, town_code):
     """
     return read_sql_cached(query, "db42280")
 
+
+@st.cache_data(ttl=3600)
+def fetch_order_placed_trend_data(start_date, end_date, town_code, selected_channels=()):
+    """Fetch order-placed counts by day and booker using Order Date (not Delivery Date)."""
+    channel_condition = ""
+    if selected_channels:
+        safe_channels = [str(channel).replace("'", "''") for channel in selected_channels]
+        channel_values = "', '".join(safe_channels)
+        channel_condition = f"AND u.`Channel Type` IN ('{channel_values}')"
+
+    query = f"""
+    SELECT
+        o.`Order Date` AS Order_Date,
+        o.`Order Booker Name` AS Booker,
+        COUNT(DISTINCT o.`Order Number`) AS Orders_Placed
+    FROM ordered_vs_delivered_rows o
+    LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
+    WHERE o.`Distributor Code` = '{town_code}'
+      AND o.`Order Date` BETWEEN '{start_date}' AND '{end_date}'
+      {channel_condition}
+    GROUP BY o.`Order Date`, o.`Order Booker Name`
+    ORDER BY o.`Order Date`
+    """
+    return read_sql_cached(query, "db42280")
+
 @st.cache_data(ttl=3600)
 def fetch_booker_leaderboard_data(start_date, end_date, town_code, selected_channels=()):
     """Fetch leaderboard metrics per Booker for selected period."""
@@ -2093,6 +2366,184 @@ def fetch_activity_segmentation_data(start_date, end_date, town_code, selected_c
     """
     return read_sql_cached(query, "db42280")
 
+
+@st.cache_data(ttl=1800)
+def fetch_unknown_brand_sku_data(start_date, end_date, town_code):
+    """Fetch SKUs sold in period where SKU is missing in master or brand is missing/unknown."""
+    query = f"""
+    WITH sales_sku AS (
+        SELECT
+            o.`SKU Code` AS SKU_Code,
+            MAX(COALESCE(NULLIF(TRIM(o.`SKU Name`), ''), 'Unknown SKU')) AS SKU_Name,
+            LOWER(TRIM(MAX(COALESCE(NULLIF(TRIM(o.`SKU Name`), ''), '')))) AS SKU_Name_Norm,
+            COUNT(DISTINCT o.`Invoice Number`) AS Invoices,
+            ROUND(SUM(COALESCE(o.`Delivered Amount`, 0) + COALESCE(o.`Total Discount`, 0)), 0) AS Sales_Value,
+            ROUND(SUM(COALESCE(o.`Delivered (Litres)`, 0) + COALESCE(o.`Delivered (KG)`, 0)), 2) AS Volume
+        FROM ordered_vs_delivered_rows o
+        WHERE o.`Distributor Code` = '{town_code}'
+          AND o.`Delivery Date` BETWEEN '{start_date}' AND '{end_date}'
+          AND o.`SKU Code` IS NOT NULL
+          AND TRIM(o.`SKU Code`) <> ''
+        GROUP BY o.`SKU Code`
+    ),
+    sku_master_dedup AS (
+        SELECT
+            TRIM(s.Sku_Code) AS Sku_Code,
+            MAX(NULLIF(TRIM(s.Brand), '')) AS Brand
+        FROM sku_master s
+        GROUP BY TRIM(s.Sku_Code)
+    ),
+    sku_master_name_dedup AS (
+        SELECT
+            LOWER(TRIM(sku_key)) AS sku_name_norm,
+            MAX(NULLIF(TRIM(Brand), '')) AS Brand
+        FROM (
+            SELECT Master_Sku AS sku_key, Brand FROM sku_master WHERE Master_Sku IS NOT NULL AND TRIM(Master_Sku) <> ''
+            UNION ALL
+            SELECT Short_Master AS sku_key, Brand FROM sku_master WHERE Short_Master IS NOT NULL AND TRIM(Short_Master) <> ''
+            UNION ALL
+            SELECT sku AS sku_key, Brand FROM sku_master WHERE sku IS NOT NULL AND TRIM(sku) <> ''
+        ) x
+        GROUP BY LOWER(TRIM(sku_key))
+    )
+    SELECT
+        ss.SKU_Code,
+        ss.SKU_Name,
+        COALESCE(sm.Brand, sn.Brand, '') AS Master_Brand,
+        CASE
+            WHEN sm.Sku_Code IS NULL AND sn.sku_name_norm IS NULL THEN 'SKU missing in Master SKU'
+            WHEN COALESCE(sm.Brand, sn.Brand) IS NULL OR LOWER(TRIM(COALESCE(sm.Brand, sn.Brand))) IN ('unknown', 'unkown', 'na', 'n/a') THEN 'Brand missing in Master SKU'
+            ELSE 'Brand issue'
+        END AS Missing_Reason,
+        ss.Invoices,
+        ss.Sales_Value,
+        ss.Volume
+    FROM sales_sku ss
+    LEFT JOIN sku_master_dedup sm ON sm.Sku_Code = TRIM(ss.SKU_Code)
+    LEFT JOIN sku_master_name_dedup sn ON sn.sku_name_norm = ss.SKU_Name_Norm
+    WHERE (sm.Sku_Code IS NULL AND sn.sku_name_norm IS NULL)
+       OR COALESCE(sm.Brand, sn.Brand) IS NULL
+       OR LOWER(TRIM(COALESCE(sm.Brand, sn.Brand))) IN ('unknown', 'unkown', 'na', 'n/a')
+    ORDER BY Sales_Value DESC, SKU_Code
+    """
+    return read_sql_cached(query, "db42280")
+
+
+@st.cache_data(ttl=1800)
+def fetch_current_month_target_status(town_code):
+    """Fetch summary of current-month target upload status."""
+    query = f"""
+    SELECT
+        COUNT(*) AS target_rows,
+        COUNT(DISTINCT t.`AppUser Code`) AS target_bookers,
+        COUNT(DISTINCT t.Brand) AS target_brands
+    FROM targets_new t
+    WHERE t.Distributor_Code = '{town_code}'
+      AND t.year = YEAR(CURDATE())
+      AND t.month = MONTH(CURDATE())
+      AND t.KPI = 'Value'
+    """
+    return read_sql_cached(query, "db42280")
+
+
+@st.cache_data(ttl=1800)
+def fetch_current_month_value_target_total(town_code):
+        """Fetch current-month Value target total for the selected distributor."""
+        query = f"""
+        SELECT
+                ROUND(SUM(COALESCE(t.Target, 0)), 0) AS target_value_total
+        FROM targets_new t
+        WHERE t.Distributor_Code = '{town_code}'
+            AND t.year = YEAR(CURDATE())
+            AND t.month = MONTH(CURDATE())
+            AND t.KPI = 'Value'
+        """
+        return read_sql_cached(query, "db42280")
+
+
+@st.cache_data(ttl=1800)
+def fetch_current_month_missing_targets_from_sales(town_code):
+    """Fetch current-month Booker+Brand combinations with sales but no Value target."""
+    query = f"""
+    WITH sales_pairs AS (
+        SELECT
+            o.`Order Booker Code` AS Booker_Code,
+            o.`Order Booker Name` AS Booker,
+            COALESCE(NULLIF(TRIM(s.Brand), ''), 'Unknown') AS Brand,
+            ROUND(SUM(COALESCE(o.`Delivered Amount`, 0) + COALESCE(o.`Total Discount`, 0)), 0) AS Achieved_MTD
+        FROM ordered_vs_delivered_rows o
+        LEFT JOIN sku_master s ON s.Sku_Code = o.`SKU Code`
+        WHERE o.`Distributor Code` = '{town_code}'
+          AND o.`Delivery Date` >= DATE_FORMAT(CURDATE(), '%%Y-%%m-01')
+          AND o.`Delivery Date` <= CURDATE()
+        GROUP BY o.`Order Booker Code`, o.`Order Booker Name`, COALESCE(NULLIF(TRIM(s.Brand), ''), 'Unknown')
+    ),
+    target_pairs AS (
+        SELECT DISTINCT
+            t.`AppUser Code` AS Booker_Code,
+            COALESCE(NULLIF(TRIM(t.Brand), ''), 'Unknown') AS Brand
+        FROM targets_new t
+        WHERE t.Distributor_Code = '{town_code}'
+          AND t.year = YEAR(CURDATE())
+          AND t.month = MONTH(CURDATE())
+          AND t.KPI = 'Value'
+    )
+    SELECT
+        s.Booker_Code,
+        s.Booker,
+        s.Brand,
+        s.Achieved_MTD
+    FROM sales_pairs s
+    LEFT JOIN target_pairs t
+      ON t.Booker_Code = s.Booker_Code
+     AND t.Brand = s.Brand
+    WHERE t.Booker_Code IS NULL
+    ORDER BY s.Achieved_MTD DESC, s.Booker
+    """
+    return read_sql_cached(query, "db42280")
+
+
+@st.cache_data(ttl=1800)
+def fetch_missing_shops_from_universe(start_date, end_date, town_code):
+    """Fetch stores present in order tables but missing from universe master."""
+    source_tables = [
+        "ordered_vsdelivered_summary",
+        "ordered_vs_delivered_summary",
+        "ordered_vs_delivered_rows",
+    ]
+
+    last_error = None
+    for source_table in source_tables:
+        query = f"""
+        SELECT
+            TRIM(o.`Store Code`) AS Store_Code,
+            MAX(COALESCE(NULLIF(TRIM(o.`Store Name`), ''), 'Unknown Store')) AS Store_Name,
+            MAX(COALESCE(NULLIF(TRIM(o.`Order Booker Name`), ''), 'Unknown Booker')) AS Booker,
+            COUNT(DISTINCT o.`Invoice Number`) AS Invoices,
+            ROUND(SUM(COALESCE(o.`Delivered Amount`, 0) + COALESCE(o.`Total Discount`, 0)), 0) AS Sales_Value,
+            MAX(DATE(o.`Delivery Date`)) AS Last_Delivery_Date,
+            '{source_table}' AS Source_Table
+        FROM {source_table} o
+        LEFT JOIN universe u
+          ON TRIM(u.`Store Code`) = TRIM(o.`Store Code`)
+        WHERE o.`Distributor Code` = '{town_code}'
+          AND DATE(o.`Delivery Date`) BETWEEN '{start_date}' AND '{end_date}'
+          AND o.`Store Code` IS NOT NULL
+          AND TRIM(o.`Store Code`) <> ''
+          AND u.`Store Code` IS NULL
+        GROUP BY TRIM(o.`Store Code`)
+        ORDER BY Sales_Value DESC, Store_Code
+        """
+        try:
+            return read_sql_cached(query, f"missing_shop_{source_table}")
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    if last_error:
+        raise last_error
+    return pd.DataFrame()
+
 @st.cache_data(ttl=3600)
 def fetch_activity_segmentation_booker_data(start_date, end_date, town_code, selected_channels=(), selected_bookers=()):
     """Fetch Booker + store level order frequency for booker-wise activity segmentation."""
@@ -2228,20 +2679,27 @@ def fetch_booker_brand_scoring_data(start_date, end_date, town_code, selected_ch
         booker_condition = f"AND o.`Order Booker Name` IN ('{booker_values}')"
 
     query = f"""
+    WITH sku_brand AS (
+        SELECT
+            TRIM(s.`Sku_Code`) AS sku_code,
+            MAX(NULLIF(TRIM(s.`Brand`), '')) AS brand
+        FROM sku_master s
+        GROUP BY TRIM(s.`Sku_Code`)
+    )
     SELECT
-        o.`Order Booker Name` AS Booker,
-        COALESCE(s.Brand, 'Unknown') AS Brand,
-        ROUND(SUM(o.`Delivered Amount` + o.`Total Discount`), 0) AS NMV,
+        TRIM(o.`Order Booker Name`) AS Booker,
+        COALESCE(NULLIF(TRIM(sb.brand), ''), 'Unknown') AS Brand,
+        ROUND(SUM(COALESCE(o.`Delivered Amount`, 0) + COALESCE(o.`Total Discount`, 0)), 0) AS NMV,
         COUNT(DISTINCT o.`Invoice Number`) AS Orders
     FROM ordered_vs_delivered_rows o
-    LEFT JOIN universe u ON u.`Store Code` = o.`Store Code`
-    LEFT JOIN sku_master s ON s.Sku_Code = o.`SKU Code`
+    LEFT JOIN universe u ON TRIM(u.`Store Code`) = TRIM(o.`Store Code`)
+    LEFT JOIN sku_brand sb ON sb.sku_code = TRIM(o.`SKU Code`)
     WHERE o.`Distributor Code` = '{town_code}'
       AND o.`Delivery Date` BETWEEN '{start_date}' AND '{end_date}'
       {channel_condition}
       {booker_condition}
-    GROUP BY o.`Order Booker Name`, COALESCE(s.Brand, 'Unknown')
-    HAVING SUM(o.`Delivered Amount` + o.`Total Discount`) > 0
+    GROUP BY TRIM(o.`Order Booker Name`), COALESCE(NULLIF(TRIM(sb.brand), ''), 'Unknown')
+    HAVING SUM(COALESCE(o.`Delivered Amount`, 0) + COALESCE(o.`Total Discount`, 0)) > 0
     ORDER BY Booker, NMV DESC
     """
     return read_sql_cached(query, "db42280")
@@ -2299,13 +2757,7 @@ def create_Channel_dm_sunburst(df, selected_dms=None, selected_channels=None):
 
     df_plot = df.copy()
     df_plot['StoreCount'] = pd.to_numeric(df_plot['StoreCount'], errors='coerce').fillna(0)
-    my_palette = [
-    "#FFC145",  # blue
-    "#5B5F97",  # red
-    "#B8B8D1",  # green
-    "#FFFFFB",  # orange
-    "#FF6B6C"   # purple
-]
+    my_palette = CHART_PALETTE_BASE
     fig = px.sunburst(
         df_plot,
         path=['Channel', 'Brand', 'DM'],
@@ -2407,7 +2859,7 @@ def create_Channel_performance_chart(df, metric_type='Value'):
             texttemplate='%{text}' + unit_label,
             hovertext=hover_current,
             hoverinfo='text',
-            marker=dict(color='#5B5F97')
+            marker=dict(color=CHART_COLORS['primary'])
         ),
         go.Bar(
             x=df_processed['Channel'],
@@ -2418,7 +2870,7 @@ def create_Channel_performance_chart(df, metric_type='Value'):
             texttemplate='%{text}' + unit_label,
             hovertext=hover_last_year,
             hoverinfo='text',
-            marker=dict(color='#B8B8D1')
+            marker=dict(color=CHART_COLORS['secondary'])
         ),
         go.Bar(
             x=df_processed['Channel'],
@@ -2429,7 +2881,7 @@ def create_Channel_performance_chart(df, metric_type='Value'):
             texttemplate='%{text}' + unit_label,
             hovertext=hover_last_month,
             hoverinfo='text',
-            marker=dict(color='#FFC145')
+            marker=dict(color=CHART_COLORS['accent'])
         )
     ])
     
@@ -2442,15 +2894,15 @@ def create_Channel_performance_chart(df, metric_type='Value'):
         # height=600,
         barmode='group',
         hovermode='x unified',
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor=CHART_COLORS['transparent'],
+        plot_bgcolor=CHART_COLORS['transparent'],
         font=dict(size=12, weight='bold'),
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
     )
 
     return apply_theme_aware_bar_labels(fig)
 
-def create_channel_wise_growth_chart(df, metric_type='Value'):
+def create_channel_wise_growth_chart(df, metric_type='Value', growth_basis='LY'):
     """Create channel-wise growth percentage chart with value/ltr hover details."""
     if df.empty:
         fig = go.Figure()
@@ -2494,69 +2946,59 @@ def create_channel_wise_growth_chart(df, metric_type='Value'):
     df_processed[last_year_col] = df_processed[last_year_col] / divisor
     df_processed[last_month_col] = df_processed[last_month_col] / divisor
 
-    current_vals = df_processed[current_col].round(2)
-    last_year_vals = df_processed[last_year_col].round(2)
-    last_month_vals = df_processed[last_month_col].round(2)
+    growth_basis = str(growth_basis or 'LY').upper()
+    use_ly = growth_basis != 'LM'
+    selected_growth_col = growth_ly_col if use_ly else growth_lm_col
+    selected_label = 'Growth vs Last Year' if use_ly else 'Growth vs Last Month'
+
+    df_processed = df_processed.sort_values(selected_growth_col, ascending=False).reset_index(drop=True)
 
     customdata = np.column_stack([
-        current_vals,
-        last_year_vals,
-        last_month_vals,
+        df_processed[current_col].round(2),
+        df_processed[last_year_col].round(2),
+        df_processed[last_month_col].round(2),
+        df_processed[growth_ly_col].round(1),
+        df_processed[growth_lm_col].round(1),
     ])
 
-    ly_colors = ['#B8B8D1' if value >= 0 else '#FF6B6C' for value in df_processed[growth_ly_col]]
-    lm_colors = ['#FFC145' if value >= 0 else '#FF6B6C' for value in df_processed[growth_lm_col]]
+    selected_colors = [
+        (CHART_COLORS['secondary'] if use_ly else CHART_COLORS['accent']) if value >= 0 else CHART_COLORS['danger']
+        for value in df_processed[selected_growth_col]
+    ]
 
     fig = go.Figure()
     fig.add_trace(
         go.Bar(
             x=df_processed['Channel'],
-            y=df_processed[growth_ly_col],
-            name='Growth vs Last Year',
-            marker=dict(color=ly_colors),
-            text=df_processed[growth_ly_col].apply(lambda x: f"{x:.1f}%"),
+            y=df_processed[selected_growth_col],
+            name=selected_label,
+            marker=dict(color=selected_colors),
+            text=df_processed[selected_growth_col].apply(lambda x: f"{x:.1f}%"),
             textposition='outside',
             customdata=customdata,
             hovertemplate=(
                 '<b>%{x}</b>'
-                '<br>Growth vs Last Year: %{y:.1f}%'
+                '<br>' + selected_label + ': %{y:.1f}%'
                 '<br>Current ' + metric_label + ': %{customdata[0]:.2f}' + unit_label +
                 '<br>Last Year ' + metric_label + ': %{customdata[1]:.2f}' + unit_label +
                 '<br>Last Month ' + metric_label + ': %{customdata[2]:.2f}' + unit_label +
-                '<extra></extra>'
-            )
-        )
-    )
-    fig.add_trace(
-        go.Bar(
-            x=df_processed['Channel'],
-            y=df_processed[growth_lm_col],
-            name='Growth vs Last Month',
-            marker=dict(color=lm_colors),
-            text=df_processed[growth_lm_col].apply(lambda x: f"{x:.1f}%"),
-            textposition='outside',
-            customdata=customdata,
-            hovertemplate=(
-                '<b>%{x}</b>'
-                '<br>Growth vs Last Month: %{y:.1f}%'
-                '<br>Current ' + metric_label + ': %{customdata[0]:.2f}' + unit_label +
-                '<br>Last Year ' + metric_label + ': %{customdata[1]:.2f}' + unit_label +
-                '<br>Last Month ' + metric_label + ': %{customdata[2]:.2f}' + unit_label +
+                '<br>Vs LY: %{customdata[3]:.1f}%'
+                '<br>Vs LM: %{customdata[4]:.1f}%'
                 '<extra></extra>'
             )
         )
     )
 
     fig.update_layout(
-        title=f"📈 Channel-wise Growth Percentage - {metric_type}",
+        title=f"📈 Channel-wise Growth Percentage - {metric_type} ({'vs LY' if use_ly else 'vs LM'})",
         yaxis=dict(title='Growth %'),
         xaxis=dict(title='Channel'),
         # height=500,
         barmode='group',
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor=CHART_COLORS['transparent'],
+        plot_bgcolor=CHART_COLORS['transparent'],
         font=dict(size=12, weight='bold'),
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
+        showlegend=False,
     )
 
     return apply_theme_aware_bar_labels(fig)
@@ -2642,6 +3084,11 @@ def create_brand_wise_growth_chart(df, metric_type='Value'):
     df_processed[growth_ly_col] = pd.to_numeric(df_processed[growth_ly_col], errors='coerce').fillna(0).round(1)
     df_processed[growth_lm_col] = pd.to_numeric(df_processed[growth_lm_col], errors='coerce').fillna(0).round(1)
 
+    growth_basis = st.session_state.get('brand_growth_basis_filter', 'Last Year')
+    selected_growth_col = growth_ly_col if growth_basis == 'Last Year' else growth_lm_col
+    selected_label = 'Growth vs Last Year' if growth_basis == 'Last Year' else 'Growth vs Last Month'
+
+    df_processed = df_processed.sort_values(selected_growth_col, ascending=False).reset_index(drop=True)
     df_processed['brand_short'] = df_processed['brand'].apply(lambda value: _ellipsis_label(value, 14))
     df_processed[current_col] = df_processed[current_col] / divisor
     df_processed[last_year_col] = df_processed[last_year_col] / divisor
@@ -2652,60 +3099,47 @@ def create_brand_wise_growth_chart(df, metric_type='Value'):
         df_processed[last_year_col].round(2),
         df_processed[last_month_col].round(2),
         df_processed['brand'].astype(str),
+        df_processed[growth_ly_col].round(1),
+        df_processed[growth_lm_col].round(1),
     ])
 
-    ly_colors = ['#B8B8D1' if value >= 0 else '#FF6B6C' for value in df_processed[growth_ly_col]]
-    lm_colors = ['#FFC145' if value >= 0 else '#FF6B6C' for value in df_processed[growth_lm_col]]
+    selected_colors = [
+        (CHART_COLORS['secondary'] if growth_basis == 'Last Year' else CHART_COLORS['accent']) if value >= 0 else CHART_COLORS['danger']
+        for value in df_processed[selected_growth_col]
+    ]
 
     fig = go.Figure()
     fig.add_trace(
         go.Bar(
             x=df_processed['brand_short'],
-            y=df_processed[growth_ly_col],
-            name='Growth vs Last Year',
-            marker=dict(color=ly_colors),
-            text=df_processed[growth_ly_col].apply(lambda value: f"{value:.1f}%"),
+            y=df_processed[selected_growth_col],
+            name=selected_label,
+            marker=dict(color=selected_colors),
+            text=df_processed[selected_growth_col].apply(lambda value: f"{value:.1f}%"),
             textposition='outside',
             customdata=customdata,
             hovertemplate=(
                 '<b>%{customdata[3]}</b>'
-                '<br>Growth vs Last Year: %{y:.1f}%'
+                '<br>' + selected_label + ': %{y:.1f}%'
                 '<br>Current ' + metric_label + ': %{customdata[0]:.2f}' + unit_label +
                 '<br>Last Year ' + metric_label + ': %{customdata[1]:.2f}' + unit_label +
                 '<br>Last Month ' + metric_label + ': %{customdata[2]:.2f}' + unit_label +
-                '<extra></extra>'
-            )
-        )
-    )
-    fig.add_trace(
-        go.Bar(
-            x=df_processed['brand_short'],
-            y=df_processed[growth_lm_col],
-            name='Growth vs Last Month',
-            marker=dict(color=lm_colors),
-            text=df_processed[growth_lm_col].apply(lambda value: f"{value:.1f}%"),
-            textposition='outside',
-            customdata=customdata,
-            hovertemplate=(
-                '<b>%{customdata[3]}</b>'
-                '<br>Growth vs Last Month: %{y:.1f}%'
-                '<br>Current ' + metric_label + ': %{customdata[0]:.2f}' + unit_label +
-                '<br>Last Year ' + metric_label + ': %{customdata[1]:.2f}' + unit_label +
-                '<br>Last Month ' + metric_label + ': %{customdata[2]:.2f}' + unit_label +
+                '<br>Vs LY: %{customdata[4]:.1f}%'
+                '<br>Vs LM: %{customdata[5]:.1f}%'
                 '<extra></extra>'
             )
         )
     )
 
     fig.update_layout(
-        title=f"📈 Brand-wise Growth Percentage - {metric_type}",
+        title=f"📈 Brand-wise Growth Percentage - {metric_type} ({'vs LY' if growth_basis == 'Last Year' else 'vs LM'})",
         yaxis=dict(title='Growth %'),
         xaxis=dict(title='Brand'),
         barmode='group',
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor=CHART_COLORS['transparent'],
+        plot_bgcolor=CHART_COLORS['transparent'],
         font=dict(size=12, weight='bold'),
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
+        showlegend=False,
     )
     return apply_theme_aware_bar_labels(fig)
 
@@ -2799,7 +3233,7 @@ def create_brand_wise_growth_segmented_chart(df, metric_type='Value'):
     def _growth_band(value):
         value = float(value)
         if value <= -30:
-            return '<= -30%', '#FF6B6C'
+            return '<= -30%', CHART_COLORS['danger']
         if value <= -20:
             return '-30% to -20%', '#F98080'
         if value <= -10:
@@ -2807,18 +3241,18 @@ def create_brand_wise_growth_segmented_chart(df, metric_type='Value'):
         if value < 0:
             return '-10% to 0%', '#FBCACA'
         if value == 0:
-            return '0%', '#94A3B8'
+            return '0%', CHART_COLORS['neutral']
         if value <= 10:
             return '0% to 10%', '#FFE7A3'
         if value <= 20:
             return '10% to 20%', '#FFD86B'
         if value <= 30:
-            return '20% to 30%', '#FFC145'
+            return '20% to 30%', CHART_COLORS['accent']
         if value <= 50:
             return '30% to 50%', '#A7E3A2'
         if value <= 70:
             return '50% to 70%', '#6CCD7A'
-        return '> 70%', '#16A34A'
+        return '> 70%', CHART_COLORS['success']
 
     labels = []
     ids = []
@@ -2893,14 +3327,14 @@ def create_brand_wise_growth_segmented_chart(df, metric_type='Value'):
 
     fig.update_layout(
         title=f"📈 Brand-wise Growth by Channel (Segmented) - {metric_type} | Basis: {basis_label}",
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor=CHART_COLORS['transparent'],
+        plot_bgcolor=CHART_COLORS['transparent'],
         font=dict(size=12, weight='bold'),
         margin=dict(t=70, l=10, r=10, b=10)
     )
     return fig
 
-def create_dm_wise_growth_chart(df, metric_type='Value'):
+def create_dm_wise_growth_chart(df, metric_type='Value', growth_basis='LY', deliveryman_order=None):
     """Create DM-wise growth percentage chart with value/ltr hover details."""
     if df is None or df.empty:
         fig = go.Figure()
@@ -2944,67 +3378,182 @@ def create_dm_wise_growth_chart(df, metric_type='Value'):
     df_processed[last_year_col] = df_processed[last_year_col] / divisor
     df_processed[last_month_col] = df_processed[last_month_col] / divisor
 
-    current_vals = df_processed[current_col].round(2)
-    last_year_vals = df_processed[last_year_col].round(2)
-    last_month_vals = df_processed[last_month_col].round(2)
+    growth_basis = str(growth_basis or 'LY').upper()
+    use_ly = growth_basis != 'LM'
+    selected_growth_col = growth_ly_col if use_ly else growth_lm_col
+    selected_label = 'Growth vs Last Year' if use_ly else 'Growth vs Last Month'
+
+    if deliveryman_order:
+        order_list = [str(name) for name in deliveryman_order if pd.notna(name)]
+        remaining_names = [str(name) for name in df_processed['DeliveryMan'].astype(str).tolist() if str(name) not in order_list]
+        final_order = list(dict.fromkeys(order_list + remaining_names))
+        df_processed['DeliveryMan'] = df_processed['DeliveryMan'].astype(str)
+        df_processed['DeliveryMan'] = pd.Categorical(df_processed['DeliveryMan'], categories=final_order, ordered=True)
+        df_processed = df_processed.sort_values('DeliveryMan').reset_index(drop=True)
+        df_processed['DeliveryMan'] = df_processed['DeliveryMan'].astype(str)
+    else:
+        df_processed = df_processed.sort_values(selected_growth_col, ascending=False).reset_index(drop=True)
+    bar_colors = [CHART_COLORS['success'] if value >= 0 else '#DC2626' for value in df_processed[selected_growth_col]]
 
     customdata = np.column_stack([
-        current_vals,
-        last_year_vals,
-        last_month_vals,
+        df_processed[current_col].round(2),
+        df_processed[last_year_col].round(2),
+        df_processed[last_month_col].round(2),
+        df_processed[growth_ly_col].round(1),
+        df_processed[growth_lm_col].round(1),
     ])
 
-    ly_colors = ['#B8B8D1' if value >= 0 else '#FF6B6C' for value in df_processed[growth_ly_col]]
-    lm_colors = ['#FFC145' if value >= 0 else '#FF6B6C' for value in df_processed[growth_lm_col]]
+    max_abs_growth = float(np.nanmax(np.abs(df_processed[selected_growth_col].values))) if not df_processed.empty else 0
+    axis_limit = max(10.0, max_abs_growth * 1.15)
+
     fig = go.Figure()
     fig.add_trace(
         go.Bar(
-            x=df_processed['DeliveryMan'],
-            y=df_processed[growth_ly_col],
-            name='Growth vs Last Year',
-            marker=dict(color=ly_colors),
-            text=df_processed[growth_ly_col].apply(lambda x: f"{x:.1f}%"),
-            textposition='outside',
+            y=df_processed['DeliveryMan'],
+            x=df_processed[selected_growth_col],
+            orientation='h',
+            name=selected_label,
+            marker=dict(color=bar_colors),
+            text=df_processed[selected_growth_col].apply(lambda x: f"{x:.1f}%"),
+            textposition='auto',
             customdata=customdata,
             hovertemplate=(
-                '<b>%{x}</b>'
-                '<br>Growth vs Last Year: %{y:.1f}%'
+                '<b>%{y}</b>'
+                '<br>' + selected_label + ': %{x:.1f}%'
                 '<br>Current ' + metric_label + ': %{customdata[0]:.2f}' + unit_label +
                 '<br>Last Year ' + metric_label + ': %{customdata[1]:.2f}' + unit_label +
                 '<br>Last Month ' + metric_label + ': %{customdata[2]:.2f}' + unit_label +
-                '<extra></extra>'
-            )
-        )
-    )
-    fig.add_trace(
-        go.Bar(
-            x=df_processed['DeliveryMan'],
-            y=df_processed[growth_lm_col],
-            name='Growth vs Last Month',
-            marker=dict(color=lm_colors),
-            text=df_processed[growth_lm_col].apply(lambda x: f"{x:.1f}%"),
-            textposition='outside',
-            customdata=customdata,
-            hovertemplate=(
-                '<b>%{x}</b>'
-                '<br>Growth vs Last Month: %{y:.1f}%'
-                '<br>Current ' + metric_label + ': %{customdata[0]:.2f}' + unit_label +
-                '<br>Last Year ' + metric_label + ': %{customdata[1]:.2f}' + unit_label +
-                '<br>Last Month ' + metric_label + ': %{customdata[2]:.2f}' + unit_label +
+                '<br>Vs LY: %{customdata[3]:.1f}%'
+                '<br>Vs LM: %{customdata[4]:.1f}%'
                 '<extra></extra>'
             )
         )
     )
     fig.update_layout(
-        title=f"📈 Deliveryman-wise Growth Percentage - {metric_type}",
-        yaxis=dict(title='Growth %'),
-        xaxis=dict(title='Deliveryman'),
+        title=f"📈 Deliveryman-wise Growth Percentage (Diverging) - {metric_type} ({'vs LY' if use_ly else 'vs LM'})",
+        xaxis=dict(
+            title='Growth %',
+            range=[-axis_limit, axis_limit],
+            zeroline=True,
+            zerolinewidth=2,
+            zerolinecolor=CHART_COLORS['text_muted'],
+        ),
+        yaxis=dict(title='Deliveryman', autorange='reversed'),
         # height=600,
-        barmode='group',
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor=CHART_COLORS['transparent'],
+        plot_bgcolor=CHART_COLORS['transparent'],
         font=dict(size=12, weight='bold'),
-        legend=dict( orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
+        showlegend=False,
+        margin=dict(l=8, r=8, t=52, b=8),
+        height=max(380, len(df_processed) * 28),
+    )
+    return apply_theme_aware_bar_labels(fig)
+
+def create_dm_unique_productivity_growth_chart(df, growth_basis='LY', deliveryman_order=None):
+    """Create DM-wise unique productivity growth percentage chart (current unique shops vs LY/LM)."""
+    if df is None or df.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No data available",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16, color="gray")
+        )
+        return fig
+
+    df_processed = df[[
+        'DeliveryMan',
+        'Current_Unique_Productive',
+        'Last_Year_Unique_Productive',
+        'Last_Month_Unique_Productive'
+    ]].copy()
+
+    for col in ['Current_Unique_Productive', 'Last_Year_Unique_Productive', 'Last_Month_Unique_Productive']:
+        df_processed[col] = pd.to_numeric(df_processed[col], errors='coerce').fillna(0)
+
+    current_vals = df_processed['Current_Unique_Productive']
+    ly_vals = df_processed['Last_Year_Unique_Productive']
+    lm_vals = df_processed['Last_Month_Unique_Productive']
+
+    df_processed['Unique_Prod_Growth_LY'] = np.where(
+        ly_vals > 0,
+        ((current_vals / ly_vals) - 1) * 100,
+        np.where(current_vals > 0, 100, 0)
+    )
+    df_processed['Unique_Prod_Growth_LM'] = np.where(
+        lm_vals > 0,
+        ((current_vals / lm_vals) - 1) * 100,
+        np.where(current_vals > 0, 100, 0)
+    )
+
+    growth_basis = str(growth_basis or 'LY').upper()
+    use_ly = growth_basis != 'LM'
+    selected_growth_col = 'Unique_Prod_Growth_LY' if use_ly else 'Unique_Prod_Growth_LM'
+    selected_label = 'Growth vs Last Year' if use_ly else 'Growth vs Last Month'
+
+    if deliveryman_order:
+        order_list = [str(name) for name in deliveryman_order if pd.notna(name)]
+        remaining_names = [str(name) for name in df_processed['DeliveryMan'].astype(str).tolist() if str(name) not in order_list]
+        final_order = list(dict.fromkeys(order_list + remaining_names))
+        df_processed['DeliveryMan'] = df_processed['DeliveryMan'].astype(str)
+        df_processed['DeliveryMan'] = pd.Categorical(df_processed['DeliveryMan'], categories=final_order, ordered=True)
+        df_processed = df_processed.sort_values('DeliveryMan').reset_index(drop=True)
+        df_processed['DeliveryMan'] = df_processed['DeliveryMan'].astype(str)
+    else:
+        df_processed = df_processed.sort_values(selected_growth_col, ascending=False).reset_index(drop=True)
+    bar_colors = [CHART_COLORS['success'] if value >= 0 else '#DC2626' for value in df_processed[selected_growth_col]]
+
+    customdata = np.column_stack([
+        df_processed['Current_Unique_Productive'].round(0),
+        df_processed['Last_Year_Unique_Productive'].round(0),
+        df_processed['Last_Month_Unique_Productive'].round(0),
+        df_processed['Unique_Prod_Growth_LY'].round(1),
+        df_processed['Unique_Prod_Growth_LM'].round(1),
+    ])
+
+    max_abs_growth = float(np.nanmax(np.abs(df_processed[selected_growth_col].values))) if not df_processed.empty else 0
+    axis_limit = max(10.0, max_abs_growth * 1.15)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            y=df_processed['DeliveryMan'],
+            x=df_processed[selected_growth_col],
+            orientation='h',
+            name=selected_label,
+            marker=dict(color=bar_colors),
+            text=df_processed[selected_growth_col].apply(lambda x: f"{x:.1f}%"),
+            textposition='auto',
+            customdata=customdata,
+            hovertemplate=(
+                '<b>%{y}</b>'
+                '<br>' + selected_label + ': %{x:.1f}%'
+                '<br>Current Unique Productivity: %{customdata[0]:.0f}'
+                '<br>Last Year Unique Productivity: %{customdata[1]:.0f}'
+                '<br>Last Month Unique Productivity: %{customdata[2]:.0f}'
+                '<br>Vs LY: %{customdata[3]:.1f}%'
+                '<br>Vs LM: %{customdata[4]:.1f}%'
+                '<extra></extra>'
+            )
+        )
+    )
+
+    fig.update_layout(
+        title=f"📈 Deliveryman-wise Unique Productivity Growth ({'vs LY' if use_ly else 'vs LM'})",
+        xaxis=dict(
+            title='Growth %',
+            range=[-axis_limit, axis_limit],
+            zeroline=True,
+            zerolinewidth=2,
+            zerolinecolor=CHART_COLORS['text_muted'],
+        ),
+        yaxis=dict(title='Deliveryman', autorange='reversed'),
+        paper_bgcolor=CHART_COLORS['transparent'],
+        plot_bgcolor=CHART_COLORS['transparent'],
+        font=dict(size=12, weight='bold'),
+        showlegend=False,
+        margin=dict(l=8, r=8, t=52, b=8),
+        height=max(380, len(df_processed) * 28),
     )
     return apply_theme_aware_bar_labels(fig)
 
@@ -3022,70 +3571,114 @@ def create_target_achievement_chart(df, metric_type='Value'):
         return fig
         
     if metric_type == 'Value':
-        df = df.rename(columns={'Target_Value': 'Target', 'NMV': 'Achievement'})
-        ach_percent_col = np.where(
-            pd.to_numeric(df['Target'], errors='coerce').fillna(0) > 0,
-            (pd.to_numeric(df['Achievement'], errors='coerce').fillna(0) / pd.to_numeric(df['Target'], errors='coerce').fillna(0)) * 100,
-            0,
-        )
-        ach_percent_col = pd.Series(ach_percent_col).round(1)
+        df = df.rename(columns={'Target_Value': 'Target', 'NMV': 'Achievement','Value_Ach':'Ach_per'})
+        # ach_percent_col = np.where(
+        #     pd.to_numeric(df['Target'], errors='coerce').fillna(0) > 0,
+        #     (pd.to_numeric(df['Achievement'], errors='coerce').fillna(0) / pd.to_numeric(df['Target'], errors='coerce').fillna(0)) * 100,
+        #     0,
+        # )
+        # ach_percent_col = pd.Series(ach_percent_col).round(1)
         divisor = 1_000_000
         unit_label = 'M'
         metric_label = 'Sales'
         y_axis_title = 'Sales (in Millions)'
     else:
-        df = df.rename(columns={'Target_Ltr': 'Target', 'Ltr': 'Achievement'})
-        ach_percent_col = np.where(
-            pd.to_numeric(df['Target'], errors='coerce').fillna(0) > 0,
-            (pd.to_numeric(df['Achievement'], errors='coerce').fillna(0) / pd.to_numeric(df['Target'], errors='coerce').fillna(0)) * 100,
-            0,
-        )
-        ach_percent_col = pd.Series(ach_percent_col).round(1)
+        df = df.rename(columns={'Target_Value': 'Target', 'NMV': 'Achievement','Ltr_Ach':'Ach_per'})
+        # ach_percent_col = np.where(
+        #     pd.to_numeric(df['Target'], errors='coerce').fillna(0) > 0,
+        #     (pd.to_numeric(df['Achievement'], errors='coerce').fillna(0) / pd.to_numeric(df['Target'], errors='coerce').fillna(0)) * 100,
+        #     0,
+        # )
+        # ach_percent_col = pd.Series(ach_percent_col).round(1)
         divisor = 1_000
         unit_label = 'T'
         metric_label = 'Volume'
         y_axis_title = 'Volume (in Thousands)'
 
     
-    df['period'] = pd.to_datetime(df['period'], format='%m-%Y')
+    df['Target'] = pd.to_numeric(df['Target'], errors='coerce').fillna(0)
+    df['Achievement'] = pd.to_numeric(df['Achievement'], errors='coerce').fillna(0)
+    df['Ach_per'] = pd.to_numeric(df['Ach_per'], errors='coerce').fillna(0).round(1)
+
+    df['period'] = pd.to_datetime(df['period'], format='%m-%Y', errors='coerce')
+    df = df.dropna(subset=['period']).copy()
     df.sort_values('period', inplace=True)
+    df['period_label'] = df['period'].dt.strftime('%b %Y')
+    df['band_100'] = df['Target']
+    df['variance'] = df['Achievement'] - df['Target']
+    df['ach_label'] = (df['Achievement'] / divisor).round(2).astype(str) + unit_label
+    df['inside_label'] = df['ach_label'] + "<br>" + df['Ach_per'].astype(str) + '%'
 
     fig = go.Figure()
+
     fig.add_trace(
         go.Bar(
-            x=df['period'],
-            y=df['Target'],
-            name='Target',
-            marker=dict(color='#5B5F97'),
-            text =(df['Target'] / divisor).round(2).astype(str) + unit_label,
-            textposition='inside',
-            hovertemplate=f'<b>%{{x|%b %Y}}</b><br>Target: %{{y/divisor:.2f}}{unit_label}<extra></extra>'
+            x=df['period_label'],
+            y=df['band_100'],
+            name='Target Band',
+            marker=dict(color='rgba(148, 163, 184, 0.26)'),
+            showlegend=False,
+            hovertemplate=f'<b>%{{x}}</b><br>100% Band: %{{y/divisor:.0f}}{unit_label}<extra></extra>'
         )
     )
+
     fig.add_trace(
         go.Bar(
-            x=df['period'],
+            x=df['period_label'],
             y=df['Achievement'],
             name='Achievement',
-            marker=dict(color='#FFC145'),
-            text = (
-                    (df['Achievement'] / divisor).round(2).astype(str) + unit_label
-                        + " | "
-                    + ach_percent_col.astype(str)
-                        + "%"),
+            marker=dict(color=CHART_COLORS['accent']),
+            width=0.45,
+            text=df['inside_label'],
             textposition='inside',
-            hovertemplate=f'<b>%{{x|%b %Y}}</b><br>Achievement: %{{y/divisor:.2f}}{unit_label}<extra></extra>'
+            insidetextanchor='middle',
+            textangle=0,
+            textfont=dict(color=CHART_COLORS['text_dark'], size=11),
+            # hovertemplate=(
+            #     f'<b>%{{x}}</b>'
+            #     f'<br>Achievement: %{{customdata[0]/divisor:.0f}}{unit_label}'
+            #     f'<br>Target: %{{customdata[1]/divisor:.0f}}{unit_label}'
+            #     f'<br>Variance: %{{customdata[2]/divisor:.0f}}{unit_label}'
+            #     f'<br>Achievement %: %{{customdata[3]:.1f}}%<extra></extra>'
+            # ),
+            customdata=df[['Achievement', 'Target', 'variance', 'Ach_per']].to_numpy(),
         )
     )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df['period_label'],
+            y=df['Target'],
+            mode='markers',
+            name='Target Marker',
+            marker=dict(symbol='line-ew-open', size=22, color=CHART_COLORS['text_dark'], line=dict(width=4, color=CHART_COLORS['accent'])),
+            hovertemplate=f'<b>%{{x}}</b><br>Target Marker: %{{y/divisor:.2f}}{unit_label}<extra></extra>'
+        )
+    )
+
+    max_value = max(
+        df['Achievement'].max() if not df['Achievement'].empty else 0,
+        df['Target'].max() if not df['Target'].empty else 0,
+    )
+
     fig.update_layout(
-        title=f"🎯 Target vs Achievement Comparison - {metric_label}",
-        yaxis=dict(title=y_axis_title),
-        xaxis=dict(title='Period'),
-        # height=600,
-        barmode='group',
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        # font=dict(color='white')
+        title=f"🎯 Target vs Achievement Bullet Chart - {metric_label}",
+        xaxis=dict(
+            title='Month',
+            tickangle=0,
+            categoryorder='array',
+            categoryarray=df['period_label'].tolist()
+        ),
+        yaxis=dict(title=y_axis_title, range=[0, max_value * 1.08 if max_value > 0 else 1]),
+        barmode='overlay',
+        hovermode='x unified',
+        paper_bgcolor=CHART_COLORS['transparent'],
+        plot_bgcolor=CHART_COLORS['transparent'],
+        legend=dict(orientation='h', y=1.08, x=0),
+        margin=dict(l=8, r=8, t=52, b=8),
+        uniformtext_minsize=10,
+        uniformtext_mode='hide',
+        height=max(320, len(df) * 36)
     )
     return apply_theme_aware_bar_labels(fig)
 
@@ -3726,18 +4319,18 @@ def create_routewise_sales_performance_chart(df, title_suffix=""):
     df_plot['Target_Value'] = pd.to_numeric(df_plot.get('Target_Value', 0), errors='coerce').fillna(0)
     df_plot['Achieved_Pct'] = pd.to_numeric(df_plot.get('Achieved_Pct', 0), errors='coerce').fillna(0)
     df_plot['Booker'] = df_plot.get('Booker', '').astype(str)
-    df_plot = df_plot.sort_values('Booker', ascending=True)
+    df_plot = df_plot.sort_values(['Achieved_Pct', 'Achieved_Value', 'Booker'], ascending=[False, False, True])
     df_plot['Target_Pct'] = 100
 
     def _achieved_band_color(pct):
         pct = float(pct or 0)
         if pct < 50:
-            return '#EF4444'
+            return ACHIEVEMENT_BAND_COLORS['lt_50']
         if pct < 60:
-            return '#F97316'
+            return ACHIEVEMENT_BAND_COLORS['50_60']
         if pct <= 70:
-            return '#FACC15'
-        return '#22C55E'
+            return ACHIEVEMENT_BAND_COLORS['60_70']
+        return ACHIEVEMENT_BAND_COLORS['gte_70']
 
     def _achieved_band_label(pct):
         pct = float(pct or 0)
@@ -3766,11 +4359,33 @@ def create_routewise_sales_performance_chart(df, title_suffix=""):
     fig.add_trace(
         go.Bar(
             x=x_values,
+            y=df_plot['Target_Pct'],
+            name='Target Band',
+            marker_color='rgba(148, 163, 184, 0.35)',
+            width=0.80,
+            showlegend=True,
+            customdata=target_customdata,
+            hovertemplate=(
+                '<b>%{customdata[0]}</b>'
+                # '<br>Target %: %{y:.0f}%'
+                # '<br>Target Value: Rs %{customdata[1]:,.0f}'
+                # '<br>Achieved Value: Rs %{customdata[2]:,.0f}'
+                '<extra></extra>'
+            )
+        )
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=x_values,
             y=df_plot['Achieved_Pct'],
             name='Achieved',
             marker_color=achieved_colors,
+            width=0.45,
             text=df_plot['Achieved_Pct'].apply(lambda value: f"{value:.1f}%"),
-            textposition='outside',
+            textposition='inside',
+            insidetextanchor='start',
+            cliponaxis=False,
             customdata=achieved_customdata,
             hovertemplate=(
                 '<b>%{customdata[0]}</b>'
@@ -3782,22 +4397,23 @@ def create_routewise_sales_performance_chart(df, title_suffix=""):
             )
         )
     )
+
     fig.add_trace(
-        go.Bar(
+        go.Scatter(
             x=x_values,
             y=df_plot['Target_Pct'],
+            mode='markers+text',
             name='Target',
-            marker_color='#9CA3AF',
+            marker=dict(symbol='line-ew-open', size=18, color=CHART_COLORS['target'], line=dict(width=3, color=CHART_COLORS['target'])),
             text=df_plot['Target_Value'].apply(lambda value: f"{value/1e6:.0f}M"),
-            textposition='outside',
+            textposition='top center',
             customdata=target_customdata,
-            # hovertemplate=(
-            #     '<b>%{customdata[0]}</b>'
-            #     '<br>Target %: %{y:.0f}%'
-            #     '<br>Target Value: Rs %{customdata[1]:,.0f}'
-            #     '<br>Achieved Value: Rs %{customdata[2]:,.0f}'
-            #     '<extra></extra>'
-            # )
+            hovertemplate=(
+                '<b>%{customdata[0]}</b>'
+                '<br>Target Value: Rs %{customdata[1]:,.0f}'
+                '<br>Target %: 100%'
+                '<extra></extra>'
+            )
         )
     )
 
@@ -3810,12 +4426,13 @@ def create_routewise_sales_performance_chart(df, title_suffix=""):
             ticktext=x_tick_text,
             tickangle=-25,
         ),
-        barmode='group',
+        barmode='overlay',
         hovermode='x unified',
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font=dict(color=get_theme_text_color() or '#111827'),
+        paper_bgcolor=CHART_COLORS['transparent'],
+        plot_bgcolor=CHART_COLORS['transparent'],
+        font=dict(color=get_theme_text_color() or CHART_COLORS['text_dark']),
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5),
+        yaxis_range=[0, max(120, float(df_plot['Achieved_Pct'].max()) * 1.08 if not df_plot['Achieved_Pct'].empty else 120)],
         margin=dict(l=8, r=8, t=42, b=8)
     )
     return apply_theme_aware_bar_labels(fig)
@@ -4079,7 +4696,7 @@ def render_top_bottom_brand_table(df, height_px=420):
     st.markdown(table_html, unsafe_allow_html=True)
 
 
-ACHIEVEMENT_BAND_COLORS = {
+ACHIEVEMENT_LABEL_BAND_COLORS = {
     "Below 50%": "#d62728",
     "50-59%": "#ff7f0e",
     "60-69%": "#bcbd22",
@@ -4106,7 +4723,7 @@ def render_achievement_band_legend():
                 f"<span style='font-size:12px;color:#1E293B;font-weight:600;'>{label}</span>"
                 "</div>"
             )
-            for label, color in ACHIEVEMENT_BAND_COLORS.items()
+            for label, color in ACHIEVEMENT_LABEL_BAND_COLORS.items()
         ]
     )
 
@@ -4133,17 +4750,18 @@ def get_theme_text_color():
         green = int(theme_bg[3:5], 16)
         blue = int(theme_bg[5:7], 16)
         luminance = (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255
-        return "#111827" if luminance > 0.5 else "#F8FAFC"
+        return CHART_COLORS["text_dark"] if luminance > 0.5 else CHART_COLORS["text_light"]
 
     base_theme = (st.get_option("theme.base") or "").strip().lower()
     if base_theme == "light":
-        return "#111827"
+        return CHART_COLORS["text_dark"]
     if base_theme == "dark":
-        return "#F8FAFC"
+        return CHART_COLORS["text_light"]
     return None
 
 def apply_theme_aware_bar_labels(fig):
     """Apply theme-aware text color on all bar-trace data labels."""
+    fig = apply_central_chart_palette(fig)
     label_color = get_theme_text_color()
     if label_color:
         fig.update_traces(selector=dict(type="bar"), textfont=dict(color=label_color))
@@ -4152,22 +4770,30 @@ def apply_theme_aware_bar_labels(fig):
 def render_unified_kpi_card(
     label,
     value,
-    line_gradient='linear-gradient(90deg, #06B6D4, #38BDF8)',
+    line_gradient=None,
     tooltip=None,
     delta_primary=None,
-    delta_primary_color='#10B981',
+    delta_primary_color=None,
     delta_secondary=None,
-    delta_secondary_color='#10B981',
+    delta_secondary_color=None,
     sparkline_points=None,
-    sparkline_color='#38BDF8',
+    sparkline_color=None,
 ):
     """Render a consistent KPI card style used across tabs."""
+    if line_gradient is None:
+        line_gradient = (
+            f"linear-gradient(90deg, {CHART_COLORS['brand_grad_start']}, {CHART_COLORS['brand_grad_end']})"
+        )
+    delta_primary_color = resolve_chart_color(delta_primary_color or CHART_COLORS['success'])
+    delta_secondary_color = resolve_chart_color(delta_secondary_color or CHART_COLORS['success'])
+    sparkline_color = resolve_chart_color(sparkline_color or CHART_COLORS['brand_grad_end'])
+
     label_safe = escape(str(label))
     value_safe = escape(str(value))
     tooltip_safe = escape(str(tooltip), quote=True) if tooltip else None
 
     tooltip_html = (
-        f" <span title='{tooltip_safe}' style='cursor:help;color:#94A3B8;'>?</span>"
+        f" <span title='{tooltip_safe}' style='cursor:help;color:{CHART_COLORS['neutral']};'>?</span>"
         if tooltip else ""
     )
     primary_html = (
@@ -4200,7 +4826,7 @@ def render_unified_kpi_card(
                 gradient_id = f"sparkFill{abs(hash(label_safe)) % 100000}"
                 area_points = f"0,{height - 2} {points_attr} {width},{height - 2}"
                 sparkline_html = (
-                    "<div style='margin-top:10px;background:rgba(59,130,246,0.05);border-radius:8px;padding:2px 2px 0 2px;'>"
+                    f"<div style='margin-top:10px;background:{CHART_COLORS['transparent']};border-radius:8px;padding:2px 2px 0 2px;'>"
                     f"<svg width='100%' height='{height}' viewBox='0 0 {width} {height}' preserveAspectRatio='none' role='img' aria-label='Trend'>"
                     f"<defs><linearGradient id='{gradient_id}' x1='0' y1='0' x2='0' y2='1'>"
                     f"<stop offset='0%' stop-color='{escape(str(sparkline_color), quote=True)}' stop-opacity='0.35'></stop>"
@@ -4214,11 +4840,11 @@ def render_unified_kpi_card(
             sparkline_html = ""
 
     card_html = (
-        f"<div style='background:#FFFFFF;border:1px solid #D9E3EF;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(15,23,42,0.08);'>"
+        f"<div style='background:{CHART_COLORS['surface']};border:1px solid {CHART_COLORS['border']};border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(15,23,42,0.08);'>"
         f"<div style='height:4px;background:{line_gradient};'></div>"
         "<div style='padding:14px 16px 14px 16px;text-align:left;'>"
-        f"<div style='font-size:12px;letter-spacing:3px;text-transform:uppercase;color:#64748B;margin-bottom:8px;font-weight:500;'>{label_safe}{tooltip_html}</div>"
-        f"<div style='font-size:30px;font-weight:700;color:#0F172A;line-height:1.05;'>{value_safe}</div>"
+        f"<div style='font-size:12px;letter-spacing:3px;text-transform:uppercase;color:{CHART_COLORS['text_muted']};margin-bottom:8px;font-weight:500;'>{label_safe}{tooltip_html}</div>"
+        f"<div style='font-size:30px;font-weight:700;color:{CHART_COLORS['text_dark']};line-height:1.05;'>{value_safe}</div>"
         f"{sparkline_html}"
         f"{primary_html}{secondary_html}"
         "</div></div>"
@@ -4717,7 +5343,7 @@ def create_tgtach_brand_maptree(df, achievement_below=None, selected_brands=None
         if level == 'root':
             node_colors.append('#94A3B8')
             continue
-        base_color = ACHIEVEMENT_BAND_COLORS[band]
+        base_color = ACHIEVEMENT_LABEL_BAND_COLORS[band]
         if level == 'booker':
             node_colors.append(base_color)
         else:
@@ -4897,7 +5523,7 @@ def create_tgtach_brand_booker_maptree(df, achievement_below=None, selected_bran
         if level == 'root':
             node_colors.append('#94A3B8')
             continue
-        base_color = ACHIEVEMENT_BAND_COLORS[band]
+        base_color = ACHIEVEMENT_LABEL_BAND_COLORS[band]
         if level == 'brand':
             node_colors.append(base_color)
         else:
@@ -5170,8 +5796,20 @@ def create_ob_brand_nmv_sankey(
     
 st.markdown("""
 <style>
+header[data-testid="stHeader"] {
+    background: #EDF2EF !important;
+}
+
+div[data-testid="stToolbar"] {
+    background: #EDF2EF !important;
+}
+
+div[data-testid="stDecoration"] {
+    background: #EDF2EF !important;
+}
+
 section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #B8B8D1, #B8B8D1);
+    background: linear-gradient(180deg, #EDF2EF, #EDF2EF);
 }
 
 div[data-testid="stPlotlyChart"] {
@@ -5754,13 +6392,2479 @@ def show_bot_logs_dialog(max_lines):
         time.sleep(2)
         st.rerun()
 
+    """
+SUMMARY TAB — Daily Team Review
+=================================
+Drop this entire block inside your main() function, 
+replacing your existing tab definitions line:
+
+  tab1,tab2,...,tab7=st.tabs([...])
+
+with:
+
+  tab_summary,tab1,tab2,...,tab7=st.tabs(["🗂️ Summary","📈 Sales Growth Analysis",...])
+
+Then paste the `with tab_summary:` block wherever you want in main().
+
+All helper functions (render_unified_kpi_card, fetch_* etc.) are already present
+in your existing file — this block only adds NEW render helpers and the tab UI.
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW HELPER: render_summary_section_header
+# ─────────────────────────────────────────────────────────────────────────────
+def render_summary_section_header(title: str, subtitle: str = ""):
+    st.markdown(
+        f"""
+        <div style="
+            background: linear-gradient(90deg,#5B5F97 0%,#3d4080 100%);
+            border-radius: 10px;
+            padding: 10px 18px 10px 18px;
+            margin: 18px 0 10px 0;
+            display:flex; align-items:center; gap:14px;
+        ">
+            <div>
+                <div style="font-size:16px;font-weight:800;color:#FFFFFF;letter-spacing:.5px;">{title}</div>
+                {f'<div style="font-size:12px;color:#B8B8D1;margin-top:2px;">{subtitle}</div>' if subtitle else ''}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW HELPER: render_funnel_card
+# ─────────────────────────────────────────────────────────────────────────────
+def render_funnel_card(stages: list):
+    """
+    stages = [
+        {"label": "Scheduled Visits", "value": 1200, "pct": None, "color": "#5B5F97"},
+        {"label": "Executed Visits",  "value": 980,  "pct": 81.6, "color": "#FFC145"},
+        ...
+    ]
+    """
+    blocks = []
+    for i, stage in enumerate(stages):
+        stage_label = escape(str(stage.get("label", "")))
+        stage_value = int(pd.to_numeric(stage.get("value", 0), errors="coerce") or 0)
+        stage_color = str(stage.get("color", "#5B5F97"))
+        stage_pct = stage.get("pct")
+
+        pct_html = (
+            f"<span style='font-size:11px;color:#94A3B8;margin-left:8px;'>"
+            f"({float(stage_pct):.1f}% of prev)</span>"
+            if stage_pct is not None else ""
+        )
+        arrow = (
+            "<div style='text-align:center;color:#475569;font-size:18px;line-height:1;'>▼</div>"
+            if i < len(stages) - 1 else ""
+        )
+        blocks.append(
+            "<div style='"
+            f"background:{stage_color}18;"
+            f"border:1px solid {stage_color}55;"
+            f"border-left:4px solid {stage_color};"
+            "border-radius:8px;"
+            "padding:10px 14px;"
+            "display:flex;align-items:center;justify-content:space-between;"
+            "'>"
+            f"<span style='color:#0F172A;font-size:13px;font-weight:600;'>{stage_label}</span>"
+            f"<span style='font-size:20px;font-weight:800;color:{stage_color};'>{stage_value:,}{pct_html}</span>"
+            "</div>"
+            f"{arrow}"
+        )
+    st.markdown(
+        f"<div style='display:flex;flex-direction:column;gap:2px;'>{''.join(blocks)}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW HELPER: render_booker_summary_table
+# ─────────────────────────────────────────────────────────────────────────────
+def render_booker_summary_table(df, start_date=None, end_date=None, town_code=None, auth_token=None):
+    """
+    Expects columns: Booker, Target_Value, Revenue, Achievement_Pct,
+                     Strike_Rate, SKU_Per_Bill, Planned_Calls, Executed_Calls,
+                     Active_Outlets, New_Outlets
+    Renders a color-coded compact table with inline mini-bars.
+    """
+    if df is None or df.empty:
+        st.info("No booker data available.")
+        return
+
+    rows = []
+    for _, row in df.iterrows():
+        ach = float(row.get("Achievement_Pct", 0) or 0)
+        rev = float(row.get("Revenue", 0) or 0)
+        tgt = float(row.get("Target_Value", 0) or 0)
+        strike = float(row.get("Strike_Rate", 0) or 0)
+        sku_bill = float(row.get("SKU_Per_Bill", 0) or 0)
+        planned = int(row.get("Planned_Calls", 0) or 0)
+        executed = int(row.get("Executed_Calls", 0) or 0)
+        outlets = int(row.get("Active_Outlets", 0) or 0)
+        new_out = int(row.get("New_Outlets", 0) or 0)
+        booker = escape(str(row.get("Booker", "")))
+        raw_booker = str(row.get("Booker", ""))
+
+        if start_date is not None and end_date is not None and town_code:
+            auth_qp = f"&auth_token={quote(str(auth_token))}" if auth_token else ""
+            outlet_href = (
+                f"?view=outlets"
+                f"&booker={quote(raw_booker)}"
+                f"&start={quote(str(start_date))}"
+                f"&end={quote(str(end_date))}"
+                f"&town={quote(str(town_code))}"
+                f"{auth_qp}"
+            )
+            outlets_cell = (
+                f"<a href='{outlet_href}' target='_blank' "
+                "style='color:#2563EB;font-weight:700;text-decoration:none;' "
+                "title='Open outlet list in new tab'>"
+                f"{outlets:,}</a>"
+            )
+        else:
+            outlets_cell = f"{outlets:,}"
+
+        # Achievement color
+        if ach >= 100:
+            ach_color, ach_bg = "#16A34A", "#DCFCE7"
+        elif ach >= 85:
+            ach_color, ach_bg = "#2563EB", "#DBEAFE"
+        elif ach >= 70:
+            ach_color, ach_bg = "#D97706", "#FEF3C7"
+        else:
+            ach_color, ach_bg = "#DC2626", "#FEE2E2"
+
+        strike_color = "#16A34A" if strike >= 70 else ("#D97706" if strike >= 50 else "#DC2626")
+        bar_w = min(int(ach), 100)
+
+        rows.append(
+            "<tr style='border-bottom:1px solid #EEF2F7;'>"
+            f"<td style='padding:8px 10px;font-weight:700;color:#0F172A;white-space:nowrap;'>{booker}</td>"
+            f"<td style='padding:8px 8px;color:#334155;text-align:right;'>Rs {rev/1e6:.1f}M</td>"
+            f"<td style='padding:8px 8px;color:#64748B;text-align:right;'>Rs {tgt/1e6:.1f}M</td>"
+            f"<td style='padding:8px 12px;'>"
+            f"  <div style='display:flex;align-items:center;gap:6px;'>"
+            f"    <div style='background:#E2E8F0;height:7px;width:80px;border-radius:99px;overflow:hidden;'>"
+            f"      <div style='background:{ach_color};height:100%;width:{bar_w}%;'></div></div>"
+            f"    <span style='background:{ach_bg};color:{ach_color};font-weight:700;font-size:12px;"
+            f"           padding:2px 7px;border-radius:99px;'>{ach:.0f}%</span>"
+            f"  </div>"
+            f"</td>"
+            f"<td style='padding:8px 8px;color:{strike_color};font-weight:700;text-align:center;'>{strike:.1f}%</td>"
+            f"<td style='padding:8px 8px;color:#334155;text-align:center;'>{sku_bill:.2f}</td>"
+            f"<td style='padding:8px 8px;color:#334155;text-align:center;'>{planned:,} / {executed:,}</td>"
+            f"<td style='padding:8px 8px;color:#334155;text-align:center;'>{outlets_cell}</td>"
+            f"<td style='padding:8px 8px;color:#16A34A;font-weight:600;text-align:center;'>+{new_out}</td>"
+            "</tr>"
+        )
+
+    html = (
+        "<div style='border:1px solid #D9E3EF;border-radius:12px;overflow:hidden;background:#FFFFFF;'>"
+        "<div style='max-height:440px;overflow:auto;'>"
+        "<table style='width:100%;border-collapse:collapse;font-size:13px;'>"
+        "<thead><tr style='background:#F8FAFC;text-transform:uppercase;font-size:11px;"
+        "letter-spacing:.05em;color:#64748B;'>"
+        "<th style='padding:10px;text-align:left;'>Booker</th>"
+        "<th style='padding:10px;text-align:right;'>Revenue</th>"
+        "<th style='padding:10px;text-align:right;'>Target</th>"
+        "<th style='padding:10px;text-align:left;'>Achievement</th>"
+        "<th style='padding:10px;text-align:center;'>Strike Rate</th>"
+        "<th style='padding:10px;text-align:center;'>SKU/Bill</th>"
+        "<th style='padding:10px;text-align:center;'>Planned/Done</th>"
+        "<th style='padding:10px;text-align:center;'>Outlets</th>"
+        "<th style='padding:10px;text-align:center;'>New</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table></div></div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def render_booker_outlet_list_view(booker, start_date, end_date, town_code):
+    """Render standalone outlet list view for a selected booker (opened in new tab)."""
+    town_label = {
+        "D70002202": "Karachi",
+        "D70002246": "Lahore",
+    }.get(str(town_code), str(town_code))
+
+    st.title("🏪 Booker Outlet List")
+    st.caption(f"Booker: {booker} | Town: {town_label} | Period: {start_date} → {end_date}")
+    st.markdown("[← Back to Dashboard](./)")
+
+    outlet_df = fetch_activity_segmentation_booker_data(
+        start_date,
+        end_date,
+        town_code,
+        selected_bookers=(str(booker),),
+    )
+
+    if outlet_df is None or outlet_df.empty:
+        st.info("No outlets found for selected booker and period.")
+        return
+
+    display_df = outlet_df.copy()
+    for col in ["Store_Code", "Store_Name", "Last_Order_Date", "Orders_In_Period"]:
+        if col not in display_df.columns:
+            display_df[col] = ""
+
+    display_df["Store_Code"] = display_df["Store_Code"].astype(str)
+    display_df["Store_Name"] = display_df["Store_Name"].astype(str)
+    display_df["Last_Order_Date"] = pd.to_datetime(display_df["Last_Order_Date"], errors='coerce').dt.strftime('%Y-%m-%d').fillna('-')
+    display_df["Orders_In_Period"] = pd.to_numeric(display_df["Orders_In_Period"], errors='coerce').fillna(0).astype(int)
+
+    display_df = (
+        display_df[["Store_Code", "Store_Name", "Orders_In_Period", "Last_Order_Date"]]
+        .drop_duplicates()
+        .sort_values(["Orders_In_Period", "Store_Name"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+
+    st.metric("Total Outlets", f"{display_df['Store_Code'].nunique():,}")
+    st.dataframe(display_df, use_container_width=True, hide_index=True, height=560)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW HELPER: render_brand_focus_table
+# ─────────────────────────────────────────────────────────────────────────────
+def render_brand_focus_table(brand_df, booker_total_map):
+    """
+    brand_df: brand-wise NMV per booker
+              columns: Booker, Brand, NMV
+    booker_total_map: dict {Booker: total_NMV}
+    Shows each brand as a focus chip per booker.
+    """
+    if brand_df is None or brand_df.empty:
+        st.info("No brand data available.")
+        return
+
+    df = brand_df.copy()
+    df["NMV"] = pd.to_numeric(df["NMV"], errors="coerce").fillna(0)
+    df["Pct"] = df.apply(
+        lambda r: (r["NMV"] / booker_total_map.get(str(r["Booker"]), 1)) * 100
+        if booker_total_map.get(str(r["Booker"]), 0) > 0 else 0,
+        axis=1,
+    )
+
+    rows = []
+    for booker_name, grp in df.groupby("Booker"):
+        grp = grp.sort_values("NMV", ascending=False)
+        chips = []
+        for _, brow in grp.iterrows():
+            pct = float(brow["Pct"])
+            if pct >= 30:
+                bg, fg = "#DCFCE7", "#16A34A"
+            elif pct >= 15:
+                bg, fg = "#DBEAFE", "#1D4ED8"
+            elif pct >= 5:
+                bg, fg = "#FEF3C7", "#92400E"
+            else:
+                bg, fg = "#FEE2E2", "#991B1B"
+
+            chips.append(
+                f"<span style='background:{bg};color:{fg};border-radius:99px;"
+                f"padding:3px 9px;font-size:11px;font-weight:600;display:inline-block;margin:2px;'>"
+                f"{escape(str(brow['Brand']))} {pct:.0f}%</span>"
+            )
+
+        rows.append(
+            "<tr style='border-bottom:1px solid #EEF2F7;vertical-align:middle;'>"
+            f"<td style='padding:8px 10px;font-weight:700;color:#0F172A;white-space:nowrap;"
+            f"font-size:13px;'>{escape(str(booker_name))}</td>"
+            f"<td style='padding:6px 8px;'>{''.join(chips)}</td>"
+            "</tr>"
+        )
+
+    html = (
+        "<div style='border:1px solid #D9E3EF;border-radius:12px;overflow:hidden;background:#FFFFFF;'>"
+        "<div style='max-height:380px;overflow:auto;'>"
+        "<table style='width:100%;border-collapse:collapse;font-size:13px;'>"
+        "<thead><tr style='background:#F8FAFC;text-transform:uppercase;font-size:11px;"
+        "letter-spacing:.05em;color:#64748B;'>"
+        "<th style='padding:10px;text-align:left;width:160px;'>Booker</th>"
+        "<th style='padding:10px;text-align:left;'>Brand Focus (% of booker NMV)</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table></div></div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
+    st.caption(
+        "🟢 ≥30% High Focus  |  🔵 15-30% Good  |  🟡 5-15% Low  |  🔴 <5% No Focus"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW HELPER: create_brand_target_achievement_bar (compact)
+# ─────────────────────────────────────────────────────────────────────────────
+def create_brand_tgt_ach_summary_chart(df):
+    """df: brand-level with Target_Value, NMV, Value_Ach columns + brand column."""
+    if df is None or df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No data", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    brand_agg = (
+        df.groupby("brand", as_index=False)
+        .agg(Target=("Target_Value", "sum"), NMV=("NMV", "sum"))
+    )
+    brand_agg["Ach"] = np.where(
+        brand_agg["Target"] > 0,
+        (brand_agg["NMV"] / brand_agg["Target"]) * 100,
+        0
+    ).round(1)
+    brand_agg = brand_agg.sort_values("Ach", ascending=True)
+
+    colors = [
+        "#16A34A" if v >= 100 else
+        "#2563EB" if v >= 85 else
+        "#D97706" if v >= 70 else
+        "#DC2626"
+        for v in brand_agg["Ach"]
+    ]
+
+    fig = go.Figure(go.Bar(
+        y=brand_agg["brand"],
+        x=brand_agg["Ach"],
+        orientation="h",
+        marker_color=colors,
+        text=brand_agg["Ach"].apply(lambda v: f"{v:.0f}%"),
+        textposition="outside",
+        customdata=np.column_stack([brand_agg["NMV"], brand_agg["Target"]]),
+        hovertemplate=(
+            "<b>%{y}</b><br>Achievement: %{x:.1f}%"
+            "<br>NMV: Rs %{customdata[0]:,.0f}"
+            "<br>Target: Rs %{customdata[1]:,.0f}<extra></extra>"
+        )
+    ))
+    fig.add_vline(x=100, line_dash="dash", line_color="#64748B", line_width=1)
+    fig.update_layout(
+        title="Brand-level Target vs Achievement",
+        xaxis=dict(title="Achievement %", range=[0, max(brand_agg["Ach"].max() * 1.15, 120)]),
+        yaxis=dict(title=None),
+        height=max(300, len(brand_agg) * 34),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=8, r=30, t=42, b=8),
+    )
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW HELPER: create_visit_order_delivery_funnel_chart
+# ─────────────────────────────────────────────────────────────────────────────
+def create_visit_order_delivery_funnel_chart(funnel_df, title_suffix=""):
+    """
+    funnel_df columns: Booker, Planned_Calls, Executed_Calls,
+                       Orders (from sales), NMV
+    Shows per-booker funnel bars.
+    """
+    if funnel_df is None or funnel_df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No funnel data", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    df = funnel_df.sort_values("Planned_Calls", ascending=False).head(15)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        name="Planned Visits",
+        y=df["Booker"], x=df["Planned_Calls"],
+        orientation="h", marker_color="#B8B8D1",
+        hovertemplate="<b>%{y}</b><br>Planned: %{x:,.0f}<extra></extra>"
+    ))
+    fig.add_trace(go.Bar(
+        name="Executed Visits",
+        y=df["Booker"], x=df["Executed_Calls"],
+        orientation="h", marker_color="#5B5F97",
+        hovertemplate="<b>%{y}</b><br>Executed: %{x:,.0f}<extra></extra>"
+    ))
+    fig.add_trace(go.Bar(
+        name="Orders Placed",
+        y=df["Booker"], x=df["Orders"],
+        orientation="h", marker_color="#FFC145",
+        hovertemplate="<b>%{y}</b><br>Orders: %{x:,.0f}<extra></extra>"
+    ))
+    fig.update_layout(
+        title=f"Visit → Order Funnel per Booker{title_suffix}",
+        barmode="overlay",
+        xaxis=dict(title="Count"),
+        yaxis=dict(title=None, autorange="reversed"),
+        height=max(320, len(df) * 36),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center"),
+        margin=dict(l=8, r=8, t=50, b=8),
+    )
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW HELPER: render_under_performers_card
+# ─────────────────────────────────────────────────────────────────────────────
+def render_under_performers_card(df, threshold=70):
+    """Show red-flagged bookers below threshold achievement."""
+    if df is None or df.empty:
+        return
+    under = df[pd.to_numeric(df.get("Achievement_Pct", 0), errors="coerce").fillna(0) < threshold]
+    if under.empty:
+        st.success(f"✅ All bookers are above {threshold}% achievement!")
+        return
+
+    items = []
+    for _, row in under.sort_values("Achievement_Pct").iterrows():
+        ach = float(row.get("Achievement_Pct", 0) or 0)
+        rev = float(row.get("Revenue", 0) or 0)
+        tgt = float(row.get("Target_Value", 0) or 0)
+        gap = tgt - rev
+        items.append(
+            f"<div style='background:#FEF2F2;border:1px solid #FECACA;border-left:4px solid #DC2626;"
+            f"border-radius:8px;padding:10px 14px;margin-bottom:6px;"
+            f"display:flex;justify-content:space-between;align-items:center;'>"
+            f"<div>"
+            f"  <div style='font-weight:700;color:#0F172A;font-size:14px;'>{escape(str(row.get('Booker', '')))}</div>"
+            f"  <div style='font-size:12px;color:#64748B;margin-top:2px;'>"
+            f"    Revenue: Rs {rev/1e6:.1f}M | Target: Rs {tgt/1e6:.1f}M | Gap: Rs {gap/1e6:.1f}M"
+            f"  </div>"
+            f"</div>"
+            f"<span style='background:#DC2626;color:#FFFFFF;border-radius:99px;"
+            f"padding:4px 12px;font-weight:800;font-size:14px;'>{ach:.0f}%</span>"
+            f"</div>"
+        )
+    items_html = "".join(items)
+    st.markdown(
+        "<div style='max-height:300px;overflow-y:auto;overflow-x:hidden;padding-right:4px;'>"
+        f"{items_html}"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ██████████████████████  SUMMARY TAB BLOCK  ██████████████████████████████████
+# ─────────────────────────────────────────────────────────────────────────────
+# Paste everything inside `with tab_summary:` into your main() after creating tabs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# """
+# PASTE BLOCK START — inside your main(), after tab definitions
+# ─────────────────────────────────────────────────────────────
+# with tab_summary:
+# """
+
+def render_summary_tab_content(start_date, end_date, town_code, town):
+    """
+    Call this function from inside `with tab_summary:` in your main():
+    
+        with tab_summary:
+            render_summary_tab_content(start_date, end_date, town_code, town)
+    """
+    
+
+    # ── Fetch all data needed ─────────────────────────────────────────────────
+    with st.spinner("Loading summary data…"):
+        kpi_df          = fetch_kpi_data(start_date, end_date, town_code)
+        leaderboard_df  = fetch_booker_leaderboard_data(start_date, end_date, town_code)
+        brand_score_df  = fetch_booker_brand_scoring_data(start_date, end_date, town_code)
+        calls_df        = fetch_daily_calls_trend_data(start_date, end_date, town_code)
+        orders_placed_df = fetch_order_placed_trend_data(start_date, end_date, town_code)
+        activity_booker_df = fetch_activity_segmentation_booker_data(start_date, end_date, town_code)
+
+        # period for treemap — pick most recent available
+        period_opts_df  = fetch_treemap_period_options(town_code)
+        selected_period = (
+            period_opts_df["period"].iloc[0]
+            if period_opts_df is not None and not period_opts_df.empty
+            else None
+        )
+        treemap_df = (
+            tgtvsach_brand_level(town_code, selected_period)
+            if selected_period else pd.DataFrame()
+        )
+
+    # ── 1. TOP-LINE KPIs ─────────────────────────────────────────────────────
+    render_summary_section_header(
+        "📊 Overall Performance",
+        f"{start_date} → {end_date}"
+    )
+
+    if kpi_df is not None and not kpi_df.empty:
+        start_ts = pd.to_datetime(start_date, errors='coerce')
+        end_ts = pd.to_datetime(end_date, errors='coerce')
+        today_ts = pd.Timestamp.today().normalize()
+        is_single_month_range = (
+            pd.notna(start_ts)
+            and pd.notna(end_ts)
+            and start_ts.year == end_ts.year
+            and start_ts.month == end_ts.month
+        )
+        is_current_month_range = (
+            is_single_month_range
+            and end_ts.year == today_ts.year
+            and end_ts.month == today_ts.month
+        )
+
+        def _col_sum(df, col):
+            return pd.to_numeric(df.get(col, 0), errors="coerce").fillna(0).sum()
+
+        cur_rev   = _col_sum(kpi_df, "Current_Period_Sales")
+        ly_rev    = _col_sum(kpi_df, "Last_Year_Sales")
+        lm_rev    = _col_sum(kpi_df, "Last_Month_Sales")
+        cur_ord   = _col_sum(kpi_df, "Current_Orders")
+        ly_ord    = _col_sum(kpi_df, "Last_Year_Orders")
+        lm_ord    = _col_sum(kpi_df, "Last_Month_Orders")
+        cur_ltr   = _col_sum(kpi_df, "Current_Period_Ltr")
+
+        target_rev = 0.0
+        bta_rev = 0.0
+        ach_pct_vs_target = 0.0
+        show_target_block = is_current_month_range
+        start_month = start_ts.replace(day=1) if pd.notna(start_ts) else None
+        end_month = end_ts.replace(day=1) if pd.notna(end_ts) else None
+
+        target_total_query = f"""
+        SELECT
+            ROUND(SUM(COALESCE(t.Target, 0)), 0) AS target_value_total
+        FROM targets_new t
+        WHERE t.Distributor_Code = '{town_code}'
+          AND STR_TO_DATE(CONCAT(t.year, '-', LPAD(t.month, 2, '0'), '-01'), '%%Y-%%m-%%d')
+              BETWEEN '{start_month.date() if start_month is not None else start_date}'
+                  AND '{end_month.date() if end_month is not None else end_date}'
+          AND t.KPI = 'Value'
+        """
+        target_total_df = read_sql_cached(target_total_query, f"summary_target_total_{town_code}")
+        if target_total_df is not None and not target_total_df.empty:
+            target_rev = float(
+                pd.to_numeric(target_total_df.iloc[0].get("target_value_total", 0), errors="coerce") or 0
+            )
+
+        if target_rev > 0:
+            ach_pct_vs_target = (cur_rev / target_rev) * 100
+            bta_rev = target_rev - cur_rev
+
+        aov       = cur_rev / cur_ord if cur_ord > 0 else 0
+        rev_grow_ly = ((cur_rev - ly_rev) / ly_rev * 100) if ly_rev > 0 else 0
+        rev_grow_lm = ((cur_rev - lm_rev) / lm_rev * 100) if lm_rev > 0 else 0
+
+        def _arrow(v): return ("▲" if v >= 0 else "▼"), ("#16A34A" if v >= 0 else "#DC2626")
+
+        k0, k1, k2, k3, k4 = st.columns([1, 1, 1, 1, 1])
+        a1, c1 = _arrow(rev_grow_ly)
+
+        with k0:
+            gauge_value = ach_pct_vs_target if target_rev > 0 else 0.0
+            gauge_max = max(100.0, gauge_value, 120.0)
+            if target_rev > 0:
+                gauge_color = "#16A34A" if gauge_value >= 100 else ("#D97706" if gauge_value >= 70 else "#DC2626")
+            else:
+                gauge_color = "#94A3B8"
+
+            gauge_fig = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=gauge_value,
+                number={"suffix": "%", "font": {"size": 24, "color": "#0F172A"}},
+                domain={"x": [0.06, 0.94], "y": [0.08, 0.80]},
+                gauge={
+                    "axis": {"range": [0, gauge_max]},
+                    "bar": {"color": gauge_color},
+                    "bgcolor": "#FFFFFF",
+                    "steps": [
+                        {"range": [0, 70], "color": "rgba(220,38,38,0.18)"},
+                        {"range": [70, 100], "color": "rgba(217,119,6,0.18)"},
+                        {"range": [100, gauge_max], "color": "rgba(22,163,74,0.18)"},
+                    ],
+                    "threshold": {
+                        "line": {"color": "#111827", "width": 2},
+                        "thickness": 0.8,
+                        "value": 100,
+                    },
+                },
+            ))
+            # gauge_fig.add_annotation(
+                # text="A C H I E V E M E N T",
+            #     x=0.5, y=0.93, xref="paper", yref="paper",
+            #     showarrow=False,
+            #     font=dict(size=11, color="#64748B")
+            # )
+
+            if target_rev <= 0:
+                gauge_fig.add_annotation(
+                    text="No target for selected period",
+                    x=0.5, y=0.06, xref="paper", yref="paper",
+                    showarrow=False,
+                    font=dict(size=10, color="#64748B")
+                )
+
+            gauge_fig.update_layout(
+                height=130,
+                margin=dict(t=0, b=0, l=0, r=0),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                shapes=[
+                    dict(
+                        type="rect", xref="paper", yref="paper",
+                        x0=0, y0=0, x1=1, y1=1,
+                        line=dict(color="#D9E3EF", width=1),
+                        fillcolor="#FFFFFF",
+                        layer="below",
+                    ),
+                    dict(
+                        type="rect", xref="paper", yref="paper",
+                        x0=0, y0=0.985, x1=1, y1=1,
+                        line=dict(width=0),
+                        fillcolor="#5B5F97",
+                        layer="below",
+                    ),
+                ],
+            )
+            st.plotly_chart(gauge_fig, use_container_width=True, key="summary_total_revenue_target_gauge")
+
+        with k1:
+            revenue_secondary = None
+            if show_target_block and target_rev > 0:
+                revenue_secondary = (
+                    f"Target: Rs {target_rev/1e6:.2f}M | BTA: Rs {bta_rev/1e6:.2f}M"
+                )
+
+            render_unified_kpi_card(
+                "Total Revenue", f"Rs {cur_rev/1e6:.2f}M",
+                "linear-gradient(90deg,#5B5F97,#8B8FD8)",
+                delta_primary=f"{a1} {abs(rev_grow_ly):.1f}% vs LY",
+                delta_primary_color=c1,
+                delta_secondary=revenue_secondary,
+                delta_secondary_color="#0F172A" if (show_target_block and target_rev > 0) else c1,
+            )
+        a2, c2 = _arrow((cur_rev - lm_rev) / lm_rev * 100 if lm_rev > 0 else 0)
+        with k2:
+            render_unified_kpi_card(
+                "Orders", f"{int(cur_ord):,}",
+                "linear-gradient(90deg,#FFC145,#FFD980)",
+                delta_primary=f"{a2} {abs((cur_ord-ly_ord)/ly_ord*100 if ly_ord else 0):.1f}% vs LY",
+                delta_primary_color="#16A34A" if cur_ord >= ly_ord else "#DC2626",
+            )
+        with k3:
+            render_unified_kpi_card(
+                "Volume (Litres)", f"{cur_ltr:,.0f} L",
+                "linear-gradient(90deg,#10B981,#34D399)",
+            )
+        with k4:
+            render_unified_kpi_card(
+                "Avg Order Value", f"Rs {aov/1000:.1f}K",
+                "linear-gradient(90deg,#F59E0B,#FBBF24)",
+            )
+    else:
+        st.info("No KPI data available for selected period.")
+
+    # ── 2. UNDER-PERFORMERS ALERT ────────────────────────────────────────────
+    render_summary_section_header(
+        "🚨 Under-Performing Bookers",
+        "Below 70% achievement — needs immediate attention"
+    )
+
+    if leaderboard_df is not None and not leaderboard_df.empty:
+        lb = leaderboard_df.copy()
+        for col in ["Revenue", "Target_Value", "Achievement_Pct",
+                    "Planned_Calls", "Executed_Calls", "SKU_Per_Bill",
+                    "Active_Outlets", "New_Outlets"]:
+            lb[col] = pd.to_numeric(lb.get(col, 0), errors="coerce").fillna(0)
+
+        lb["Strike_Rate"] = np.where(
+            lb["Planned_Calls"] > 0,
+            lb["Executed_Calls"] / lb["Planned_Calls"] * 100,
+            0,
+        )
+        under_col, ok_col = st.columns([1.1, 0.9])
+        with under_col:
+            st.markdown("**⚠️ Bookers Below 70% Achievement**")
+            render_under_performers_card(lb, threshold=70)
+        with ok_col:
+            # Donut of achievement band distribution
+            bands = {
+                "≥100%": int((lb["Achievement_Pct"] >= 100).sum()),
+                "85-99%": int(((lb["Achievement_Pct"] >= 85) & (lb["Achievement_Pct"] < 100)).sum()),
+                "70-84%": int(((lb["Achievement_Pct"] >= 70) & (lb["Achievement_Pct"] < 85)).sum()),
+                "<70%": int((lb["Achievement_Pct"] < 70).sum()),
+            }
+            fig_bands = go.Figure(go.Pie(
+                labels=list(bands.keys()),
+                values=list(bands.values()),
+                hole=0.55,
+                marker_colors=["#16A34A", "#2563EB", "#D97706", "#DC2626"],
+                textinfo="label+value",
+                hovertemplate="<b>%{label}</b>: %{value} bookers<extra></extra>",
+            ))
+            fig_bands.add_annotation(
+                text=f"<b>{len(lb)}</b><br>Bookers",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=15, color="#0F172A"),
+            )
+            fig_bands.update_layout(
+                title="Achievement Band Split",
+                height=300, margin=dict(t=42, l=8, r=8, b=8),
+                paper_bgcolor="rgba(0,0,0,0)",
+                showlegend=False,
+            )
+            st.plotly_chart(fig_bands, use_container_width=True, key="summary_ach_donut")
+    else:
+        st.info("No leaderboard data available.")
+
+    # ── 3. BOOKER PERFORMANCE TABLE ──────────────────────────────────────────
+    render_summary_section_header(
+        "🏅 Booker Performance Snapshot",
+        "Achievement, Strike Rate, SKU/Bill, Visits"
+    )
+
+    if leaderboard_df is not None and not leaderboard_df.empty:
+        lb_sorted = lb.sort_values("Achievement_Pct", ascending=False)
+
+        snapshot_df = lb_sorted.copy()
+        if calls_df is not None and not calls_df.empty:
+            calls_snapshot = (
+                calls_df
+                .groupby("Booker", as_index=False)
+                .agg(
+                    Planned_Calls=("Planned_Calls", "sum"),
+                    Executed_Calls=("Executed_Calls", "sum"),
+                )
+            )
+
+            snapshot_df = snapshot_df.merge(
+                calls_snapshot,
+                on="Booker",
+                how="outer",
+                suffixes=("_lb", "_calls"),
+            )
+
+            if "Planned_Calls_calls" in snapshot_df.columns:
+                snapshot_df["Planned_Calls"] = pd.to_numeric(
+                    snapshot_df["Planned_Calls_calls"], errors="coerce"
+                ).fillna(
+                    pd.to_numeric(snapshot_df.get("Planned_Calls_lb", 0), errors="coerce").fillna(0)
+                )
+
+            if "Executed_Calls_calls" in snapshot_df.columns:
+                snapshot_df["Executed_Calls"] = pd.to_numeric(
+                    snapshot_df["Executed_Calls_calls"], errors="coerce"
+                ).fillna(
+                    pd.to_numeric(snapshot_df.get("Executed_Calls_lb", 0), errors="coerce").fillna(0)
+                )
+
+            for col in [
+                "Revenue", "Target_Value", "Achievement_Pct", "Strike_Rate", "SKU_Per_Bill",
+                "Active_Outlets", "New_Outlets", "Planned_Calls", "Executed_Calls"
+            ]:
+                snapshot_df[col] = pd.to_numeric(snapshot_df.get(col, 0), errors="coerce").fillna(0)
+
+            snapshot_df["Strike_Rate"] = np.where(
+                snapshot_df["Planned_Calls"] > 0,
+                snapshot_df["Executed_Calls"] / snapshot_df["Planned_Calls"] * 100,
+                snapshot_df.get("Strike_Rate", 0),
+            )
+
+            snapshot_df = snapshot_df.sort_values(
+                ["Revenue", "Planned_Calls", "Booker"],
+                ascending=[False, False, True],
+            )
+
+        outlet_link_token = create_link_auth_token(st.session_state.get("username"), ttl_seconds=1800)
+        render_booker_summary_table(
+            snapshot_df,
+            start_date=start_date,
+            end_date=end_date,
+            town_code=town_code,
+            auth_token=outlet_link_token,
+        )
+    else:
+        st.info("No booker performance data.")
+
+    # ── 4. BRAND FOCUS PER BOOKER ────────────────────────────────────────────
+    render_summary_section_header(
+        "🎯 Brand Focus per Booker",
+        "Which brands each booker is pushing — and neglecting"
+    )
+
+    if brand_score_df is not None and not brand_score_df.empty:
+        bdf = brand_score_df.copy()
+        bdf["NMV"] = pd.to_numeric(bdf["NMV"], errors="coerce").fillna(0)
+        booker_totals = bdf.groupby("Booker")["NMV"].sum().to_dict()
+
+        bf_left, bf_right = st.columns([1.4, 1])
+        with bf_left:
+            render_brand_focus_table(bdf, booker_totals)
+        with bf_right:
+            # Top brands overall donut
+            brand_total = bdf.groupby("Brand")["NMV"].sum().reset_index().sort_values("NMV", ascending=False).head(8)
+            fig_brand = go.Figure(go.Pie(
+                labels=brand_total["Brand"],
+                values=brand_total["NMV"],
+                hole=0.45,
+                textinfo="label+percent",
+                hovertemplate="<b>%{label}</b>: Rs %{value:,.0f}<extra></extra>",
+            ))
+            fig_brand.update_layout(
+                title="Overall Brand NMV Split",
+                height=340, margin=dict(t=42, l=8, r=8, b=8),
+                paper_bgcolor="rgba(0,0,0,0)",
+                showlegend=False,
+            )
+            st.plotly_chart(fig_brand, use_container_width=True, key="summary_brand_donut")
+    else:
+        st.info("No brand-level data available.")
+
+    # ── 5. BRAND TARGET vs ACHIEVEMENT ───────────────────────────────────────
+    render_summary_section_header(
+        "📦 Brand-Level Target vs Achievement",
+        f"Period: {selected_period or 'N/A'}"
+    )
+
+    if not treemap_df.empty:
+        brand_tgt_left, brand_tgt_right = st.columns([1, 1.3])
+        with brand_tgt_left:
+            st.plotly_chart(
+                create_brand_tgt_ach_summary_chart(treemap_df),
+                use_container_width=True,
+                key="summary_brand_tgt_ach_bar"
+            )
+        with brand_tgt_right:
+            # Compact brand table
+            brand_tgt_agg = (
+                treemap_df.groupby("brand", as_index=False)
+                .agg(Target=("Target_Value","sum"), NMV=("NMV","sum"))
+            )
+            brand_tgt_agg["Ach%"] = np.where(
+                brand_tgt_agg["Target"] > 0,
+                (brand_tgt_agg["NMV"] / brand_tgt_agg["Target"] * 100).round(1),
+                0
+            )
+            brand_tgt_agg["Gap"] = brand_tgt_agg["Target"] - brand_tgt_agg["NMV"]
+            brand_tgt_agg = brand_tgt_agg.sort_values("Ach%", ascending=False)
+
+            rows_b = []
+            for _, r in brand_tgt_agg.iterrows():
+                ach = float(r["Ach%"])
+                c = ("#16A34A" if ach >= 100 else "#2563EB" if ach >= 85
+                     else "#D97706" if ach >= 70 else "#DC2626")
+                rows_b.append(
+                    "<tr style='border-bottom:1px solid #EEF2F7;'>"
+                    f"<td style='padding:7px 10px;font-weight:600;'>{escape(str(r['brand']))}</td>"
+                    f"<td style='padding:7px 8px;text-align:right;'>Rs {r['NMV']/1e6:.1f}M</td>"
+                    f"<td style='padding:7px 8px;text-align:right;color:#64748B;'>Rs {r['Target']/1e6:.1f}M</td>"
+                    f"<td style='padding:7px 8px;text-align:center;font-weight:700;color:{c};'>{ach:.0f}%</td>"
+                    f"<td style='padding:7px 8px;text-align:right;color:#DC2626;'>-Rs {r['Gap']/1e6:.1f}M</td>"
+                    "</tr>"
+                )
+            tbl = (
+                "<div style='border:1px solid #D9E3EF;border-radius:12px;overflow:hidden;"
+                "background:#FFFFFF;max-height:340px;overflow:auto;'>"
+                "<table style='width:100%;border-collapse:collapse;font-size:13px;'>"
+                "<thead><tr style='background:#F8FAFC;font-size:11px;color:#64748B;"
+                "text-transform:uppercase;letter-spacing:.05em;'>"
+                "<th style='padding:10px;text-align:left;'>Brand</th>"
+                "<th style='padding:10px;text-align:right;'>NMV</th>"
+                "<th style='padding:10px;text-align:right;'>Target</th>"
+                "<th style='padding:10px;text-align:center;'>Ach%</th>"
+                "<th style='padding:10px;text-align:right;'>Gap</th>"
+                f"</tr></thead><tbody>{''.join(rows_b)}</tbody></table></div>"
+            )
+            st.markdown(tbl, unsafe_allow_html=True)
+    else:
+        st.info("No brand target data available. Please select a period with uploaded targets.")
+
+    # ── 6. VISIT → ORDER → DELIVERY FUNNEL ───────────────────────────────────
+    render_summary_section_header(
+        "🔄 Schedule → Visit → Order → Delivery Funnel",
+        "How calls convert through the sales pipeline per booker"
+    )
+
+    if calls_df is not None and not calls_df.empty:
+
+        calls_agg = (
+            calls_df
+            .groupby("Booker", as_index=False)
+            .agg(
+                Planned_Calls=("Planned_Calls", "sum"),
+                Executed_Calls=("Executed_Calls", "sum"),
+                Productive_Calls=("Productive_Calls", "sum"),
+            )
+        )
+        orders_agg = pd.DataFrame(columns=["Booker", "Orders"])
+        if orders_placed_df is not None and not orders_placed_df.empty:
+            orders_agg = (
+                orders_placed_df
+                .groupby("Booker", as_index=False)
+                .agg(Orders=("Orders_Placed", "sum"))
+            )
+
+        funnel_df = calls_agg.merge(
+            orders_agg,
+            on="Booker",
+            how="outer",
+        )
+
+        if leaderboard_df is not None and not leaderboard_df.empty:
+            lb_orders = (
+                leaderboard_df[["Booker", "Orders"]]
+                .copy()
+                .rename(columns={"Orders": "Orders_Delivered"})
+            )
+            funnel_df = funnel_df.merge(lb_orders, on="Booker", how="left")
+
+        def _coalesce_metric(df, metric_name: str):
+            candidate_cols = [
+                f"{metric_name}_calls",
+                metric_name,
+                f"{metric_name}_lb",
+            ]
+            series_list = []
+            for col_name in candidate_cols:
+                if col_name in df.columns:
+                    series_list.append(pd.to_numeric(df[col_name], errors="coerce"))
+
+            if not series_list:
+                return pd.Series(0, index=df.index, dtype="float64")
+
+            out = series_list[0]
+            for s in series_list[1:]:
+                out = out.combine_first(s)
+            return out.fillna(0)
+
+        for metric in ["Planned_Calls", "Executed_Calls", "Productive_Calls"]:
+            funnel_df[metric] = _coalesce_metric(funnel_df, metric)
+
+        funnel_df["Orders"] = pd.to_numeric(funnel_df.get("Orders", 0), errors="coerce").fillna(0)
+
+        funnel_df = funnel_df.fillna(0)
+
+        # Overall funnel numbers
+        total_planned    = int(funnel_df["Planned_Calls"].sum())
+        total_executed   = int(funnel_df["Executed_Calls"].sum())
+        total_productive = int(funnel_df["Productive_Calls"].sum())
+        total_orders     = int(funnel_df["Orders"].sum()) if "Orders" in funnel_df.columns else int(cur_ord)
+
+        funnelcol1, funnelcol2 = st.columns([1, 2])
+        with funnelcol1:
+            st.markdown("**Overall Pipeline**")
+            stages = [
+                {"label": "📅 Scheduled Visits", "value": total_planned, "pct": None, "color": "#5B5F97"},
+                {"label": "✅ Executed Visits",   "value": total_executed,
+                 "pct": (total_executed / total_planned * 100) if total_planned else 0, "color": "#FFC145"},
+                {"label": "🛒 Productive Calls",  "value": total_productive,
+                 "pct": (total_productive / total_executed * 100) if total_executed else 0, "color": "#10B981"},
+                {"label": "📦 Orders Placed",     "value": total_orders,
+                 "pct": (total_orders / total_productive * 100) if total_productive else 0, "color": "#06B6D4"},
+            ]
+            render_funnel_card(stages)
+            # Strike rate KPI
+            overall_strike = (total_productive / total_planned * 100) if total_planned else 0
+            strike_color = "#16A34A" if overall_strike >= 70 else "#D97706" if overall_strike >= 50 else "#DC2626"
+            st.markdown(
+                f"<div style='margin-top:12px;text-align:center;background:#F8FAFC;"
+                f"border:1px solid #E2E8F0;border-radius:10px;padding:12px;'>"
+                f"<div style='font-size:12px;color:#64748B;letter-spacing:2px;"
+                f"text-transform:uppercase;'>Overall Strike Rate</div>"
+                f"<div style='font-size:36px;font-weight:900;color:{strike_color};'>"
+                f"{overall_strike:.1f}%</div></div>",
+                unsafe_allow_html=True,
+            )
+
+        with funnelcol2:
+            st.plotly_chart(
+                create_visit_order_delivery_funnel_chart(funnel_df, f" | {start_date}→{end_date}"),
+                use_container_width=True,
+                key="summary_funnel_chart"
+            )
+    else:
+        st.info("Calls / order data not available for funnel chart.")
+
+    # ── 7. SKU/BILL PER BOOKER (bar) ─────────────────────────────────────────
+    render_summary_section_header(
+        "🧾 SKU per Bill — Booker Comparison",
+        "Higher = more products being cross-sold per visit"
+    )
+
+    if leaderboard_df is not None and not leaderboard_df.empty and "SKU_Per_Bill" in lb.columns:
+        sku_df = lb[["Booker", "SKU_Per_Bill"]].sort_values("SKU_Per_Bill", ascending=True).copy()
+        avg_sku = float(sku_df["SKU_Per_Bill"].mean())
+        sku_colors = ["#16A34A" if v >= avg_sku else "#FFC145" for v in sku_df["SKU_Per_Bill"]]
+        fig_sku = go.Figure(go.Bar(
+            y=sku_df["Booker"],
+            x=sku_df["SKU_Per_Bill"],
+            orientation="h",
+            marker_color=sku_colors,
+            text=sku_df["SKU_Per_Bill"].apply(lambda v: f"{v:.2f}"),
+            textposition="outside",
+            hovertemplate="<b>%{y}</b><br>SKU/Bill: %{x:.2f}<extra></extra>"
+        ))
+        fig_sku.add_vline(x=avg_sku, line_dash="dash", line_color="#64748B", line_width=1)
+        fig_sku.add_annotation(
+            x=avg_sku, y=1.05, yref="paper",
+            text=f"Avg: {avg_sku:.2f}",
+            showarrow=False, font=dict(color="#64748B", size=11),
+        )
+        fig_sku.update_layout(
+            xaxis=dict(title="SKU per Bill"),
+            yaxis=dict(title=None),
+            height=max(200, len(sku_df) * 34),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(l=8, r=30, t=10, b=8),
+        )
+        st.plotly_chart(fig_sku, use_container_width=True, key="summary_sku_bill_chart")
+    else:
+        st.info("SKU per Bill data not available.")
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    st.markdown(
+        "<div style='margin-top:24px;text-align:center;color:#94A3B8;font-size:12px;'>"
+        "📋 Summary auto-generated from live DB | Refresh sidebar filters to update"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+#### new section brand coverage ###################
+# """
+# ================================================================
+# BRAND COVERAGE TAB — Per Visit, Per Shop Brand Analysis
+# ================================================================
+# Tracks 3 priority brands on every shop visit:
+#   ☕ Tarang
+#   🥛 Olpers Milk
+#   📦 Olpers TBA  ← All SKUs where sku_master.slug = '.Olper TBA' (exact)
+
+# Data Sources:
+#   visits   → visits_summary_rows  (real visit tracking)
+#   sales    → ordered_vs_delivered_rows  (delivered units)
+#   brand    → sku_master.slug for Olpers TBA reclassification
+
+# INTEGRATION:
+#   1. Paste all functions into your main dashboard file (before main())
+#   2. Add tab:  tab_bc, tab1,... = st.tabs(["🏪 Brand Coverage", ...])
+#   3. Add:      with tab_bc: render_brand_coverage_tab(start_date, end_date, town_code)
+
+# NOTE: If visits_summary_rows column names differ in your DB,
+#       adjust the column aliases in fetch_visits_data() below.
+# ================================================================
+# """
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+PRIORITY_BRANDS_CONFIG = {
+    "Tarang":     {"color": "#FFC145", "icon": "☕"},
+    "Olpers Milk": {"color": "#5B5F97", "icon": "🥛"},
+    "Olpers TBA": {"color": "#10B981", "icon": "📦"},
+}
+
+def _brand_col(brand: str) -> str:
+    return brand.lower().replace(" ", "_").replace("/", "_")
+
+
+def _brand_style(brand: str) -> dict:
+    """Return color/icon style for a brand with safe fallback for dynamic brands."""
+    return PRIORITY_BRANDS_CONFIG.get(brand, {"color": "#64748B", "icon": "🏷️"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — Get all Olpers TBA SKU codes from sku_master.slug
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=3600)
+def fetch_olpers_tba_sku_codes(db_key="db42280"):
+    """
+    Returns list of SKU codes where slug = '.Olper TBA' (exact dot prefix match).
+    Multiple SKU codes map to this slug — all of them get classified as Olpers TBA.
+    """
+    query = """
+    SELECT TRIM(Sku_Code) AS sku_code
+    FROM sku_master
+    WHERE slug = '.Olper TBA'
+    """
+    df = read_sql_cached(query, db_key)
+    if df is None or df.empty:
+        return []
+    return df["sku_code"].dropna().astype(str).str.strip().tolist()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — Fetch visits from visits_summary_rows
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=1800)
+def fetch_visits_data(start_date, end_date, town_code, db_key="db42280"):
+    """
+    Fetches all shop visits from visits_summary_rows.
+
+    ⚠️  COLUMN NAME MAPPING — adjust these if your table differs:
+        visit_date    → your date column
+        store_code    → your outlet/store code column
+        store_name    → your outlet/store name column
+        booker_name   → your booker/salesman column
+        distributor_code → your distributor/town column
+    """
+    query = f"""
+    SELECT
+                v.`Visit Date` AS visit_date,
+                TRIM(v.`Invoice Number`) AS inv,
+                TRIM(v.`Order Number`) AS order_no,
+            COALESCE(TRIM(v.`Visit Complete`), '') AS visit_complete,
+            COALESCE(TRIM(v.`Non Productive w.r.t Order`), '') AS non_productive,
+                TRIM(
+                        COALESCE(
+                                NULLIF(TRIM(v.`Order Number`), ''),
+                                NULLIF(TRIM(v.`Invoice Number`), '')
+                        )
+                ) AS doc_no,
+                v.`Store Code` AS store_code,
+                v.`Store Name` AS store_name,
+                TRIM(SUBSTRING_INDEX(v.`App User`, '[', 1)) AS booker_name,
+                v.`Distributor` AS distributor_code
+    FROM visits_summary_rows v
+    WHERE TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(v.`Distributor`, '[', -1),']',1)) = '{town_code}'
+            AND v.`Visit Date` BETWEEN '{start_date}' AND '{end_date}'
+    """
+    return read_sql_cached(query, db_key)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — Fetch sales with brand classification
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=1800)
+def fetch_sales_with_brand(start_date, end_date, town_code, db_key="db42280"):
+    """
+    Gets delivered line items with dynamic Olpers TBA reclassification.
+    Uses the SKU code list from sku_master.slug to classify Olpers TBA.
+    """
+    tba_codes = fetch_olpers_tba_sku_codes(db_key)
+
+    if tba_codes:
+        tba_in   = ", ".join(f"'{c}'" for c in tba_codes)
+        tba_case = f"WHEN TRIM(o.`SKU Code`) IN ({tba_in}) THEN 'Olpers TBA'"
+    else:
+        # Fallback: use slug join directly with exact match
+        tba_case = "WHEN m.slug = '.Olper TBA' THEN 'Olpers TBA'"
+
+    query = f"""
+    SELECT
+        o.`Store Code`          AS store_code,
+        o.`Store Name`          AS store_name,
+        o.`Order Booker Name`   AS booker_name,
+        o.`Order Date`          AS visit_date,
+        TRIM(o.`Invoice Number`) AS inv,
+        TRIM(o.`Order Number`)   AS order_no,
+        TRIM(
+            COALESCE(
+                NULLIF(TRIM(o.`Order Number`), ''),
+                NULLIF(TRIM(o.`Invoice Number`), '')
+            )
+        ) AS doc_no,
+        o.`SKU Code`            AS sku_code,
+        CASE
+            {tba_case}
+            WHEN LOWER(TRIM(COALESCE(m.slug, ''))) LIKE '%%.olper tba%%'
+                THEN 'Olpers TBA'
+            WHEN LOWER(TRIM(COALESCE(m.brand,''))) LIKE '%%tarang%%'
+                 OR LOWER(TRIM(COALESCE(m.slug,''))) LIKE '%%tarang%%'
+                THEN 'Tarang'
+            WHEN (
+                    LOWER(TRIM(COALESCE(m.brand,''))) = 'olpers milk'
+                 )
+                THEN 'Olpers Milk'
+            ELSE COALESCE(NULLIF(TRIM(m.brand),''), 'Other')
+        END AS brand_classified,
+                COALESCE(o.`Order Units`, 0) AS delivered_units,
+                COALESCE(o.`Order Amount`, 0)
+            + COALESCE(o.`Total Discount`, 0) AS nmv
+    FROM ordered_vs_delivered_rows o
+    LEFT JOIN sku_master m ON TRIM(m.Sku_Code) = TRIM(o.`SKU Code`)
+    WHERE o.`Distributor Code` = '{town_code}'
+            AND o.`Order Date` BETWEEN '{start_date}' AND '{end_date}'
+            AND COALESCE(o.`Order Units`, 0) > 0
+    """
+    return read_sql_cached(query, db_key)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 — Build visit-level brand coverage table
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=1800)
+def build_visit_brand_coverage(start_date, end_date, town_code):
+    """
+    Joins visits (visits_summary_rows) with sales (ordered_vs_delivered_rows).
+    Each row = one visit. Columns show which priority brands were sold.
+
+    Returns:
+      visit_date, store_code, store_name, booker_name,
+            sold_tarang, sold_olpers_milk, sold_olpers_tba,
+      brands_sold_count, all_3_brands, coverage_score, total_nmv
+    """
+    visits_df = fetch_visits_data(start_date, end_date, town_code)
+    sales_df = fetch_sales_with_brand(start_date, end_date, town_code)
+    priority_brands = list(PRIORITY_BRANDS_CONFIG.keys())
+
+    if visits_df is None or visits_df.empty:
+        return pd.DataFrame()
+
+    vf_raw = visits_df.copy()
+    vf_raw["visit_date"] = pd.to_datetime(vf_raw["visit_date"], errors="coerce").dt.normalize()
+    vf_raw["store_code"] = vf_raw.get("store_code", "").astype(str).str.strip()
+    vf_raw["booker_name"] = vf_raw.get("booker_name", "").astype(str).str.strip()
+    vf_raw["store_name"] = vf_raw.get("store_name", "").astype(str)
+    vf_raw["inv"] = vf_raw.get("inv", "").astype(str).str.strip()
+    vf_raw["order_no"] = vf_raw.get("order_no", "").astype(str).str.strip()
+    vf_raw["doc_no"] = vf_raw.get("doc_no", "").astype(str).str.strip()
+    vf_raw["visit_complete"] = vf_raw.get("visit_complete", "").astype(str).str.strip().str.lower()
+    vf_raw["non_productive"] = vf_raw.get("non_productive", "").astype(str).str.strip().str.lower()
+    vf_raw = vf_raw.dropna(subset=["visit_date"])
+
+    base_visit_id = (
+        vf_raw["store_code"].astype(str)
+        + "||"
+        + vf_raw["booker_name"].astype(str)
+        + "||"
+        + vf_raw["visit_date"].dt.strftime("%Y-%m-%d")
+    )
+    vf_raw["visit_id"] = np.where(
+        vf_raw["doc_no"] != "",
+        base_visit_id + "||" + vf_raw["doc_no"],
+        base_visit_id,
+    )
+
+    vf = (
+        vf_raw.sort_values(["visit_id", "store_name"])
+        .drop_duplicates(subset=["visit_id"], keep="last")
+        [["visit_id", "visit_date", "store_code", "store_name", "booker_name", "visit_complete", "non_productive"]]
+        .copy()
+    )
+
+    brand_universe = list(priority_brands)
+    if sales_df is not None and not sales_df.empty and "brand_classified" in sales_df.columns:
+        dynamic_brands = (
+            sales_df["brand_classified"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .replace("", np.nan)
+            .dropna()
+            .unique()
+            .tolist()
+        )
+        brand_universe = sorted(set(priority_brands + dynamic_brands))
+
+    for brand in brand_universe:
+        vf[f"sold_{_brand_col(brand)}"] = False
+    vf["sold_other"] = False
+    vf["total_nmv"] = 0.0
+
+    if sales_df is not None and not sales_df.empty:
+        sf = sales_df.copy()
+        sf["visit_date"] = pd.to_datetime(sf.get("visit_date", None), errors="coerce").dt.normalize()
+        sf["store_code"] = sf.get("store_code", "").astype(str).str.strip()
+        sf["booker_name"] = sf.get("booker_name", "").astype(str).str.strip()
+        sf["inv"] = sf.get("inv", "").astype(str).str.strip()
+        sf["order_no"] = sf.get("order_no", "").astype(str).str.strip()
+        sf["doc_no"] = sf.get("doc_no", "").astype(str).str.strip()
+        sf["nmv"] = pd.to_numeric(sf.get("nmv", 0), errors="coerce").fillna(0)
+        sf = sf.dropna(subset=["visit_date"])
+
+        for brand in brand_universe:
+            sf[f"flag_{_brand_col(brand)}"] = sf["brand_classified"] == brand
+        sf["flag_other"] = ~sf["brand_classified"].isin(brand_universe)
+
+        sales_by_doc = (
+            sf[sf["doc_no"] != ""]
+            .groupby(["store_code", "doc_no"], as_index=False)
+            .agg(
+                total_nmv=("nmv", "sum"),
+                **{
+                    f"sold_{_brand_col(b)}": (f"flag_{_brand_col(b)}", "max")
+                    for b in brand_universe
+                },
+                sold_other=("flag_other", "max"),
+            )
+        )
+
+        visit_doc_links = (
+            vf_raw[vf_raw["doc_no"] != ""][["visit_id", "store_code", "doc_no"]]
+            .drop_duplicates()
+        )
+
+        agg_dict = {"total_nmv": "sum"}
+        for brand in brand_universe:
+            agg_dict[f"sold_{_brand_col(brand)}"] = "max"
+        agg_dict["sold_other"] = "max"
+
+        visit_sales_parts = []
+
+        if not visit_doc_links.empty and not sales_by_doc.empty:
+            visit_sales_doc = visit_doc_links.merge(
+                sales_by_doc,
+                on=["store_code", "doc_no"],
+                how="left",
+            )
+            visit_sales_parts.append(visit_sales_doc)
+
+        sales_by_day = (
+            sf.groupby(["store_code", "booker_name", "visit_date"], as_index=False)
+            .agg(
+                total_nmv=("nmv", "sum"),
+                **{
+                    f"sold_{_brand_col(b)}": (f"flag_{_brand_col(b)}", "max")
+                    for b in brand_universe
+                },
+                sold_other=("flag_other", "max"),
+            )
+        )
+
+        visit_day_links = (
+            vf_raw[vf_raw["doc_no"] == ""][
+                ["visit_id", "store_code", "booker_name", "visit_date"]
+            ]
+            .drop_duplicates()
+        )
+
+        if not visit_day_links.empty and not sales_by_day.empty:
+            visit_sales_day = visit_day_links.merge(
+                sales_by_day,
+                on=["store_code", "booker_name", "visit_date"],
+                how="left",
+            )
+            visit_sales_parts.append(visit_sales_day)
+
+        if visit_sales_parts:
+            visit_sales = pd.concat(visit_sales_parts, ignore_index=True)
+            visit_sales = visit_sales.groupby("visit_id", as_index=False).agg(agg_dict)
+
+            vf = vf.merge(visit_sales, on="visit_id", how="left", suffixes=("", "_calc"))
+
+            vf["total_nmv"] = pd.to_numeric(vf.get("total_nmv_calc", vf.get("total_nmv", 0)), errors="coerce").fillna(0)
+            for brand in brand_universe:
+                col = f"sold_{_brand_col(brand)}"
+                calc_col = f"{col}_calc"
+                vf[col] = vf.get(calc_col, vf.get(col, False)).fillna(False).astype(bool)
+            vf["sold_other"] = vf.get("sold_other_calc", vf.get("sold_other", False)).fillna(False).astype(bool)
+
+            drop_cols = [c for c in vf.columns if c.endswith("_calc")]
+            if drop_cols:
+                vf = vf.drop(columns=drop_cols)
+
+    sold_cols = [f"sold_{_brand_col(b)}" for b in priority_brands]
+    vf["brands_sold_count"] = vf[sold_cols].sum(axis=1)
+    vf["all_3_brands"] = vf["brands_sold_count"] == len(priority_brands)
+    vf["coverage_score"] = (vf["brands_sold_count"] / len(priority_brands) * 100).round(1)
+
+    return vf
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHART HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _empty_fig(msg="No data available"):
+    fig = go.Figure()
+    fig.add_annotation(text=msg, xref="paper", yref="paper",
+                       x=0.5, y=0.5, showarrow=False,
+                       font=dict(size=15, color="#64748B"))
+    fig.update_layout(height=300, paper_bgcolor="rgba(0,0,0,0)",
+                      plot_bgcolor="rgba(0,0,0,0)")
+    return fig
+
+
+def chart_coverage_donut(df, booker_filter=None, active_brands=None):
+    """What % of visits had full/partial/no coverage for selected brands?"""
+    if df is None or df.empty:
+        return _empty_fig()
+    d = df[df["booker_name"].isin(booker_filter)].copy() if booker_filter else df.copy()
+
+    selected_brands = [b for b in (active_brands or list(PRIORITY_BRANDS_CONFIG.keys())) if b in PRIORITY_BRANDS_CONFIG]
+    if not selected_brands:
+        return _empty_fig("Select at least one brand")
+
+    brand_count = len(selected_brands)
+    levels = list(range(brand_count, -1, -1))
+    counts = [int((d["brands_sold_count"] == i).sum()) for i in levels]
+    total = sum(counts)
+
+    labels = []
+    for i in levels:
+        if i == brand_count:
+            labels.append(f"All {brand_count} Brands")
+        elif i == 0:
+            labels.append("0 Brands")
+        else:
+            labels.append(f"{i} Brand{'s' if i != 1 else ''}")
+
+    color_map = {
+        0: "#DC2626",
+        1: "#D97706",
+        2: "#2563EB",
+        3: "#16A34A",
+    }
+    marker_colors = [color_map.get(i, "#334155") for i in levels]
+
+    fig = go.Figure(go.Pie(
+        labels=labels,
+        values=counts, hole=0.58,
+        marker_colors=marker_colors,
+        textinfo="label+percent",
+        hovertemplate="<b>%{label}</b>: %{value:,} visits (%{percent})<extra></extra>",
+    ))
+    fig.add_annotation(text=f"<b>{total:,}</b><br>Visits",
+                       x=0.5, y=0.5, showarrow=False,
+                       font=dict(size=15, color="#0F172A"))
+    fig.update_layout(
+        title="Brand Coverage per Visit", height=340,
+        legend=dict(orientation="h", y=-0.12, x=0.5, xanchor="center"),
+        paper_bgcolor="rgba(0,0,0,0)", margin=dict(t=42, l=8, r=8, b=60),
+    )
+    return fig
+
+
+def chart_booker_brand_bar(df, active_brands=None):
+    """Per booker: % of visits where each brand was sold — grouped bars."""
+    if df is None or df.empty:
+        return _empty_fig()
+
+    priority_brands = list(active_brands or list(PRIORITY_BRANDS_CONFIG.keys()))
+    if not priority_brands:
+        return _empty_fig("Select at least one brand")
+    booker_total = df.groupby("booker_name")["visit_date"].count().rename("total")
+    fig = go.Figure()
+
+    for brand in priority_brands:
+        col = f"sold_{_brand_col(brand)}"
+        if col not in df.columns:
+            continue
+        sold = df.groupby("booker_name")[col].sum()
+        pct  = (sold / booker_total * 100).fillna(0).round(1)
+        cfg = _brand_style(brand)
+        fig.add_trace(go.Bar(
+            name=f"{cfg['icon']} {brand}",
+            x=pct.index, y=pct.values,
+            marker_color=cfg["color"],
+            text=pct.apply(lambda v: f"{v:.0f}%"), textposition="outside",
+            customdata=sold.values,
+            hovertemplate=(f"<b>%{{x}}</b> — {brand}<br>"
+                           "Coverage: %{y:.1f}%<br>"
+                           "Visits with brand: %{customdata:,}<extra></extra>"),
+        ))
+
+    fig.update_layout(
+        title="Per Booker — % of Visits Where Each Brand Was Sold",
+        barmode="group",
+        yaxis=dict(title="% of Visits", range=[0, 115]),
+        xaxis=dict(title=None, tickangle=-25),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center"),
+        margin=dict(l=8, r=8, t=50, b=8), height=420,
+    )
+    return fig
+
+
+def chart_daily_trend(df, booker_filter=None, active_brands=None):
+    """Daily % of visits with full selected-brand coverage + per-brand trend lines."""
+    if df is None or df.empty:
+        return _empty_fig()
+    d = df[df["booker_name"].isin(booker_filter)].copy() if booker_filter else df.copy()
+    d["visit_date"] = pd.to_datetime(d["visit_date"], errors="coerce")
+
+    daily = d.groupby("visit_date").agg(
+        total=("store_code", "count"), all3=("all_3_brands", "sum")
+    ).reset_index().sort_values("visit_date")
+    daily["pct_all3"] = (daily["all3"] / daily["total"] * 100).round(1)
+
+    selected_brands = list(active_brands or list(PRIORITY_BRANDS_CONFIG.keys()))
+    if not selected_brands:
+        return _empty_fig("Select at least one brand")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=daily["visit_date"], y=daily["pct_all3"],
+        mode="lines+markers", name=f"All {len(selected_brands)} Brands",
+        line=dict(color="#16A34A", width=2.5),
+        fill="tozeroy", fillcolor="rgba(22,163,74,0.10)",
+        hovertemplate=f"<b>%{{x|%d-%b}}</b> — All {len(selected_brands)}: %{{y:.1f}}%<extra></extra>",
+    ))
+    for brand in selected_brands:
+        col = f"sold_{_brand_col(brand)}"
+        if col not in d.columns:
+            continue
+        db = d.groupby("visit_date").agg(
+            total=("store_code", "count"), sold=(col, "sum")
+        ).reset_index().sort_values("visit_date")
+        db["pct"] = (db["sold"] / db["total"] * 100).round(1)
+        cfg = _brand_style(brand)
+        fig.add_trace(go.Scatter(
+            x=db["visit_date"], y=db["pct"],
+            mode="lines", name=f"{cfg['icon']} {brand}",
+            line=dict(color=cfg["color"], width=1.8, dash="dot"),
+            hovertemplate=f"<b>%{{x|%d-%b}}</b> — {brand}: %{{y:.1f}}%<extra></extra>",
+        ))
+
+    fig.update_layout(
+        title="Daily Brand Coverage Trend (% of Visits)",
+        yaxis=dict(title="% of Visits", range=[0, 110]),
+        xaxis=dict(title=None),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center"),
+        hovermode="x unified", margin=dict(l=8, r=8, t=50, b=8), height=360,
+    )
+    return fig
+
+
+def chart_miss_rate_heatmap(df, active_brands=None):
+    """
+    Heatmap: Booker (y) × Brand (x) = % visits where brand was MISSING.
+    Red = high miss rate = needs attention.
+    """
+    if df is None or df.empty:
+        return _empty_fig()
+
+    priority_brands = list(active_brands or list(PRIORITY_BRANDS_CONFIG.keys()))
+    if not priority_brands:
+        return _empty_fig("Select at least one brand")
+    booker_total = df.groupby("booker_name")["visit_date"].count().rename("total")
+    miss_pct = {}
+    for brand in priority_brands:
+        col = f"sold_{_brand_col(brand)}"
+        if col not in df.columns:
+            miss_pct[brand] = pd.Series(dtype=float)
+            continue
+        sold = df.groupby("booker_name")[col].sum()
+        miss_pct[brand] = ((1 - sold / booker_total) * 100).fillna(100).round(1)
+
+    matrix = pd.DataFrame(miss_pct).fillna(100).sort_values(
+        priority_brands[0], ascending=False
+    )
+    brand_labels = [f"{_brand_style(b)['icon']} {b}" for b in matrix.columns]
+
+    annotations = [
+        dict(x=brand_labels[ci], y=booker,
+             text=f"{matrix.iat[ri, ci]:.0f}%",
+             showarrow=False, font=dict(size=12, color="white"))
+        for ri, booker in enumerate(matrix.index)
+        for ci in range(len(matrix.columns))
+    ]
+
+    fig = go.Figure(go.Heatmap(
+        z=matrix.values, x=brand_labels, y=matrix.index.tolist(),
+        colorscale=[[0, "#DCFCE7"], [0.5, "#FEF3C7"], [1, "#DC2626"]],
+        zmin=0, zmax=100, colorbar=dict(title="Miss %"),
+        hovertemplate="<b>%{y}</b> — %{x}<br>Miss Rate: %{z:.1f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Brand Miss Rate per Booker  (Red = Frequently Missed)",
+        annotations=annotations,
+        height=max(300, len(matrix) * 38 + 100),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=8, r=8, t=50, b=8),
+    )
+    return fig
+
+
+def chart_last_visit_gap(df, booker_filter=None, active_brands=None):
+    """% of shops where each brand was MISSING on their most recent visit."""
+    if df is None or df.empty:
+        return _empty_fig()
+    selected_brands = list(active_brands or list(PRIORITY_BRANDS_CONFIG.keys()))
+    if not selected_brands:
+        return _empty_fig("Select at least one brand")
+
+    d = df[df["booker_name"].isin(booker_filter)].copy() if booker_filter else df.copy()
+    d["visit_date"] = pd.to_datetime(d["visit_date"], errors="coerce").dt.normalize()
+    d["store_code"] = d.get("store_code", "").astype(str).str.strip()
+    d = d.dropna(subset=["visit_date"])
+    d = d[d["store_code"] != ""]
+
+    if d.empty:
+        return _empty_fig("No shops found")
+
+    sold_cols = []
+    for brand in selected_brands:
+        col = f"sold_{_brand_col(brand)}"
+        if col not in d.columns:
+            d[col] = False
+        d[col] = d[col].fillna(False).astype(bool)
+        sold_cols.append(col)
+
+    # Consolidate same-day rows for a shop first (handles multi-order same-day visits),
+    # then pick the most recent visit-date per shop.
+    daily_shop = (
+        d.groupby(["store_code", "visit_date"], as_index=False)
+        .agg(**{col: (col, "max") for col in sold_cols})
+    )
+    last = daily_shop.sort_values(["store_code", "visit_date"]).groupby("store_code").tail(1)
+    total = len(last)
+    if total == 0:
+        return _empty_fig("No shops found")
+
+    rows = []
+    for brand in selected_brands:
+        col  = f"sold_{_brand_col(brand)}"
+        miss = int((~last.get(col, pd.Series([False]*total)).fillna(False).astype(bool)).sum())
+        cfg = _brand_style(brand)
+        rows.append({"brand": f"{cfg['icon']} {brand}",
+                     "miss_pct": round(miss/total*100, 1),
+                     "miss_count": miss, "color": cfg["color"]})
+
+    md = pd.DataFrame(rows).sort_values("miss_pct", ascending=False)
+    fig = go.Figure(go.Bar(
+        x=md["brand"], y=md["miss_pct"],
+        marker_color=md["color"].tolist(),
+        text=md.apply(lambda r: f"{r['miss_pct']:.1f}%\n({r['miss_count']:,} shops)", axis=1),
+        textposition="outside",
+        hovertemplate="<b>%{x}</b><br>Missing last visit: %{y:.1f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        title=f"Brand Missed on Last Visit  ({total:,} shops total)",
+        yaxis=dict(title="% Shops — Brand MISSING", range=[0, 115]),
+        xaxis=dict(title=None),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=340, showlegend=False, margin=dict(l=8, r=8, t=50, b=8),
+    )
+    return fig
+
+
+def chart_daily_brand_shop_sunburst(start_date, end_date, town_code, booker_filter=None, active_brands=None, all_brands=None):
+    """Sunburst: selected Brand bucket -> Date -> distinct shop count (+ Other)."""
+    visit_df = build_visit_brand_coverage(start_date, end_date, town_code)
+    if visit_df is None or visit_df.empty:
+        return _empty_fig("No visit data available for sunburst")
+
+    d = visit_df.copy()
+    d["visit_date"] = pd.to_datetime(d.get("visit_date", None), errors="coerce").dt.normalize()
+    d["store_code"] = d.get("store_code", "").astype(str).str.strip()
+    d["booker_name"] = d.get("booker_name", "").astype(str).str.strip()
+    d["visit_complete"] = d.get("visit_complete", "").astype(str).str.strip().str.lower()
+    d["non_productive"] = d.get("non_productive", "").astype(str).str.strip().str.lower()
+    d = d.dropna(subset=["visit_date"])
+    d = d[d["store_code"] != ""]
+
+    if booker_filter:
+        d = d[d["booker_name"].isin(booker_filter)]
+
+    if d.empty:
+        return _empty_fig("No matching visits found for selected filters")
+
+    base_brands = list(all_brands or PRIORITY_BRANDS_CONFIG.keys())
+    selected_brands = list(active_brands or base_brands)
+    if not selected_brands:
+        return _empty_fig("Select at least one brand")
+
+    unselected_brands = [b for b in base_brands if b not in selected_brands]
+    for b in unselected_brands:
+        col_name = f"sold_{_brand_col(b)}"
+        if col_name not in d.columns:
+            d[col_name] = False
+    other_parts = [d.get("sold_other", False)]
+    other_parts.extend(d[f"sold_{_brand_col(b)}"] for b in unselected_brands if f"sold_{_brand_col(b)}" in d.columns)
+    d["sold_other_dynamic"] = np.logical_or.reduce([pd.Series(p).fillna(False).astype(bool).values for p in other_parts]) if other_parts else False
+
+    bucket_defs = [(brand, f"sold_{_brand_col(brand)}") for brand in selected_brands] + [("Other", "sold_other_dynamic")]
+
+    frames = []
+    for bucket_name, col_name in bucket_defs:
+        if col_name not in d.columns:
+            continue
+        sub = d[d[col_name].fillna(False).astype(bool)]
+        if sub.empty:
+            continue
+        tmp = (
+            sub.groupby("visit_date", as_index=False)["store_code"]
+            .nunique()
+            .rename(columns={"store_code": "shop_count"})
+        )
+        tmp["brand_bucket"] = bucket_name
+        frames.append(tmp)
+
+    if not frames:
+        return _empty_fig("No brand shop counts available")
+
+    sun_df = pd.concat(frames, ignore_index=True)
+    if sun_df.empty:
+        return _empty_fig("No shop counts available")
+
+    sun_df["day_label"] = pd.to_datetime(sun_df["visit_date"]).dt.strftime("%d-%b")
+    sun_df["day_sort"] = pd.to_datetime(sun_df["visit_date"])
+    sun_df = sun_df.sort_values(["day_sort", "brand_bucket"], ascending=[True, True])
+
+    brand_label_map = {
+        brand: f"{_brand_style(brand).get('icon', '')} {brand}".strip()
+        for brand in selected_brands
+    }
+    brand_label_map["Other"] = "Other"
+    sun_df["brand_label"] = sun_df["brand_bucket"].map(brand_label_map).fillna(sun_df["brand_bucket"])
+    d["is_assigned"] = 1
+    d["is_productive"] = (
+        (d["visit_complete"] == "yes")
+        & (d["non_productive"] != "yes")
+    ).astype(int)
+    d["productive_store_code"] = np.where(d["is_productive"] == 1, d["store_code"], np.nan)
+
+    day_stats = (
+        d.groupby("visit_date", as_index=False)
+        .agg(
+            assigned_visits=("is_assigned", "sum"),
+            productive_visits=("is_productive", "sum"),
+            assigned_shops=("store_code", "nunique"),
+            productive_shops=("productive_store_code", "nunique"),
+        )
+    )
+    sun_df = sun_df.merge(day_stats, on="visit_date", how="left")
+
+    sun_df["assigned_visits"] = pd.to_numeric(sun_df.get("assigned_visits", 0), errors="coerce").fillna(0).astype(int)
+    sun_df["productive_visits"] = pd.to_numeric(sun_df.get("productive_visits", 0), errors="coerce").fillna(0).astype(int)
+    sun_df["assigned_shops"] = pd.to_numeric(sun_df.get("assigned_shops", 0), errors="coerce").fillna(0).astype(int)
+    sun_df["productive_shops"] = pd.to_numeric(sun_df.get("productive_shops", 0), errors="coerce").fillna(0).astype(int)
+
+    color_map = {
+        f"{_brand_style(b)['icon']} {b}": _brand_style(b)["color"]
+        for b in selected_brands
+    }
+    color_map["Other"] = "#94A3B8"
+
+    fig = px.sunburst(
+        sun_df,
+        path=["brand_label", "day_label"],
+        values="shop_count",
+        color="brand_label",
+        color_discrete_map=color_map,
+        custom_data=["assigned_visits"],
+    )
+    fig.update_traces(
+        branchvalues="total",
+        textinfo="label+value",
+        hovertemplate=(
+            "<b>%{label}</b><br>"
+            "Shops Sold: %{value:,}<br>"
+            "Assigned Visits: %{customdata[0]:,}<extra></extra>"
+        ),
+    )
+    fig.update_layout(
+        title=f"Daily Shop Reach by Brand ({len(selected_brands)} Selected + Other)",
+        height=500,
+        margin=dict(l=8, r=8, t=50, b=8),
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+def render_sunburst_shop_detail_table(df, max_rows=300, active_brands=None, all_brands=None):
+    """Render shop-level detail table for sunburst with Date/Brand filters."""
+    if df is None or df.empty:
+        st.info("No shop detail data available.")
+        return
+
+    d = df.copy()
+    d["visit_date"] = pd.to_datetime(d.get("visit_date", None), errors="coerce").dt.normalize()
+    d["store_code"] = d.get("store_code", "").astype(str).str.strip()
+    d["store_name"] = d.get("store_name", "").astype(str).str.strip()
+    d["booker_name"] = d.get("booker_name", "").astype(str).str.strip()
+    d["total_nmv"] = pd.to_numeric(d.get("total_nmv", 0), errors="coerce").fillna(0)
+    d = d.dropna(subset=["visit_date"])
+    d = d[d["store_code"] != ""]
+
+    base_brands = list(all_brands or PRIORITY_BRANDS_CONFIG.keys())
+    selected_brands = list(active_brands or base_brands)
+    if not selected_brands:
+        st.info("Select at least one brand.")
+        return
+
+    sold_cols = [f"sold_{_brand_col(b)}" for b in base_brands] + ["sold_other"]
+    for col in sold_cols:
+        if col not in d.columns:
+            d[col] = False
+        d[col] = d[col].fillna(False).astype(bool)
+
+    # Complete assigned shop list (includes no-order/no-sale shops).
+    detail_df = (
+        d.groupby(["visit_date", "store_code", "store_name", "booker_name"], as_index=False)
+        .agg(
+            total_nmv=("total_nmv", "sum"),
+            **{col: (col, "max") for col in sold_cols if col in d.columns}
+        )
+    )
+    selected_sold_cols = [f"sold_{_brand_col(b)}" for b in selected_brands if f"sold_{_brand_col(b)}" in detail_df.columns]
+    unselected_sold_cols = [f"sold_{_brand_col(b)}" for b in base_brands if b not in selected_brands and f"sold_{_brand_col(b)}" in detail_df.columns]
+    detail_df["sold_other_dynamic"] = detail_df[["sold_other"] + unselected_sold_cols].any(axis=1) if (unselected_sold_cols or "sold_other" in detail_df.columns) else False
+    detail_df["any_sold"] = detail_df[selected_sold_cols + ["sold_other_dynamic"]].any(axis=1) if selected_sold_cols else detail_df["sold_other_dynamic"]
+    detail_df["order_status"] = np.where(detail_df["any_sold"], "Order", "No Order")
+
+    day_assigned = (
+        detail_df.groupby("visit_date", as_index=False)
+        .agg(assigned_shops=("store_code", "nunique"))
+    )
+    detail_df = detail_df.merge(day_assigned, on="visit_date", how="left")
+    detail_df["assigned_shops"] = pd.to_numeric(detail_df.get("assigned_shops", 0), errors="coerce").fillna(0).astype(int)
+    detail_df["visit_date_str"] = detail_df["visit_date"].dt.strftime("%d-%b-%Y")
+
+    date_options = ["All Dates"] + sorted(detail_df["visit_date_str"].dropna().unique().tolist())
+    brand_options = ["All Brands"] + [f"{_brand_style(b)['icon']} {b}" for b in selected_brands] + ["Other"]
+
+    f1, f2 = st.columns(2)
+    with f1:
+        sel_date = st.selectbox("Date", options=date_options, index=0, key="bc_sun_tbl_date")
+    with f2:
+        sel_brand = st.selectbox("Brand", options=brand_options, index=0, key="bc_sun_tbl_brand")
+
+    view_df = detail_df.copy()
+    if sel_date != "All Dates":
+        view_df = view_df[view_df["visit_date_str"] == sel_date]
+
+    brand_col_map = {
+        **{f"{_brand_style(b)['icon']} {b}": f"sold_{_brand_col(b)}" for b in selected_brands},
+        "Other": "sold_other_dynamic",
+    }
+    if sel_brand != "All Brands":
+        selected_col = brand_col_map.get(sel_brand)
+        if selected_col and selected_col in view_df.columns:
+            view_df["selected_brand_sold"] = np.where(view_df[selected_col], "Yes", "No")
+        else:
+            view_df["selected_brand_sold"] = "No"
+    else:
+        view_df["selected_brand_sold"] = "-"
+
+    if view_df.empty:
+        st.info("No shops for selected Date/Brand filter.")
+        return
+
+    view_df = view_df.sort_values(["visit_date", "store_name"], ascending=[False, True])
+
+    st.caption(
+        f"Rows: {len(view_df):,} | Distinct Shops: {view_df['store_code'].nunique():,}"
+    )
+    st.dataframe(
+        view_df[[
+            "visit_date_str", "store_code", "store_name", "booker_name",
+            "order_status", "selected_brand_sold", "assigned_shops", "total_nmv"
+        ]]
+        .rename(
+            columns={
+                "visit_date_str": "Date",
+                "store_code": "Shop Code",
+                "store_name": "Shop Name",
+                "booker_name": "Booker",
+                "order_status": "Order Status",
+                "selected_brand_sold": "Selected Brand Sold",
+                "assigned_shops": "Assigned Shops",
+                "total_nmv": "NMV",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+        height=500,
+    )
+
+
+def render_daily_booker_coverage_matrix(df, active_brands=None, max_bookers=60, all_brands=None):
+    """Render daily coverage matrix: Booker x Date with brand-wise sold counts and total visits."""
+    if df is None or df.empty:
+        st.info("No data available for daily coverage matrix.")
+        return
+
+    d = df.copy()
+    d["visit_date"] = pd.to_datetime(d.get("visit_date", None), errors="coerce").dt.normalize()
+    d["booker_name"] = d.get("booker_name", "").astype(str).str.strip()
+    d["store_code"] = d.get("store_code", "").astype(str).str.strip()
+    d = d.dropna(subset=["visit_date"])
+    d = d[(d["booker_name"] != "") & (d["store_code"] != "")]
+
+    if d.empty:
+        st.info("No valid visit rows for matrix.")
+        return
+
+    base_brands = list(all_brands or PRIORITY_BRANDS_CONFIG.keys())
+    selected_brands = list(active_brands or base_brands)
+    if not selected_brands:
+        st.info("Select at least one Focus Brand.")
+        return
+
+    for b in base_brands:
+        col = f"sold_{_brand_col(b)}"
+        if col not in d.columns:
+            d[col] = False
+        d[col] = d[col].fillna(False).astype(bool)
+
+    if "sold_other" not in d.columns:
+        d["sold_other"] = False
+    d["sold_other"] = d["sold_other"].fillna(False).astype(bool)
+
+    unselected_brands = [b for b in base_brands if b not in selected_brands]
+    other_inputs = [d["sold_other"]]
+    for b in unselected_brands:
+        other_inputs.append(d[f"sold_{_brand_col(b)}"])
+    d["sold_other_dynamic"] = np.logical_or.reduce([x.values for x in other_inputs]) if other_inputs else False
+
+    agg_dict = {"assigned_visits": ("visit_id", "nunique")}
+    for b in selected_brands:
+        agg_dict[f"sold_{_brand_col(b)}"] = (f"sold_{_brand_col(b)}", "sum")
+    agg_dict["sold_other_dynamic"] = ("sold_other_dynamic", "sum")
+
+    daily = (
+        d.groupby(["booker_name", "visit_date"], as_index=False)
+        .agg(**agg_dict)
+    )
+    if daily.empty:
+        st.info("No grouped daily data for matrix.")
+        return
+
+    booker_order = (
+        daily.groupby("booker_name", as_index=False)["assigned_visits"]
+        .sum()
+        .sort_values("assigned_visits", ascending=False)["booker_name"]
+        .head(int(max_bookers))
+        .tolist()
+    )
+    daily = daily[daily["booker_name"].isin(booker_order)]
+
+    date_cols = sorted(daily["visit_date"].dropna().unique().tolist())
+    if not date_cols:
+        st.info("No date columns available for matrix.")
+        return
+
+    rows_html = []
+    for booker in booker_order:
+        row_cells = [
+            f"<td style='padding:8px 10px;font-weight:700;color:#0F172A;white-space:nowrap;text-align:center;'>"
+            f"{escape(str(booker))}</td>"
+        ]
+
+        bdf = daily[daily["booker_name"] == booker]
+        lookup = {pd.Timestamp(r["visit_date"]).normalize(): r for _, r in bdf.iterrows()}
+
+        for dt in date_cols:
+            key = pd.Timestamp(dt).normalize()
+            rec = lookup.get(key)
+            if rec is None:
+                row_cells.append("<td style='padding:8px 10px;color:#94A3B8;text-align:center;'>-</td>")
+                continue
+
+            assigned = int(pd.to_numeric(rec.get("assigned_visits", 0), errors="coerce") or 0)
+            lines = []
+            for b in selected_brands:
+                col = f"sold_{_brand_col(b)}"
+                val = int(pd.to_numeric(rec.get(col, 0), errors="coerce") or 0)
+                pct = (val / assigned * 100) if assigned > 0 else 0
+                cfg = _brand_style(b)
+                txt_color = "#DC2626" if pct < 60 else "#0F172A"
+                lines.append(
+                    f"<div style='font-size:12px;line-height:1.35;color:{txt_color};text-align:center;'>"
+                    f"{cfg.get('icon', '')} {escape(b)} = <b>{val}</b></div>"
+                )
+
+            other_val = int(pd.to_numeric(rec.get("sold_other_dynamic", 0), errors="coerce") or 0)
+            other_pct = (other_val / assigned * 100) if assigned > 0 else 0
+            other_color = "#DC2626" if other_pct < 60 else "#0F172A"
+            lines.append(
+                f"<div style='font-size:12px;line-height:1.35;color:{other_color};text-align:center;'>Other = <b>{other_val}</b></div>"
+            )
+            lines.append(
+                f"<div style='font-size:12px;line-height:1.35;color:#334155;margin-top:4px;text-align:center;'>"
+                f"T.Visit: <b>{assigned}</b></div>"
+            )
+
+            row_cells.append(
+                "<td style='padding:8px 10px;vertical-align:top;border-left:1px solid #E5EAF1;text-align:center;'>"
+                + "".join(lines)
+                + "</td>"
+            )
+
+        rows_html.append("<tr style='border-bottom:1px solid #EEF2F7;'>" + "".join(row_cells) + "</tr>")
+
+    header_cells = ["<th style='padding:10px;text-align:center;min-width:220px;'>Booker Name</th>"]
+    for dt in date_cols:
+        header_cells.append(
+            f"<th style='padding:10px;text-align:center;min-width:180px;'>"
+            f"{pd.to_datetime(dt).strftime('%d-%b')}</th>"
+        )
+
+    table_html = (
+        "<div style='border:1px solid #D9E3EF;border-radius:12px;overflow:hidden;background:#FFFFFF;'>"
+        "<div style='max-height:520px;overflow:auto;'>"
+        "<table style='width:100%;border-collapse:collapse;font-size:13px;'>"
+        "<thead><tr style='background:#F8FAFC;color:#64748B;text-transform:uppercase;"
+        "font-size:11px;letter-spacing:.04em;position:sticky;top:0;z-index:2;'>"
+        + "".join(header_cells)
+        + "</tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody>"
+        "</table></div></div>"
+    )
+
+    st.markdown(table_html, unsafe_allow_html=True)
+    st.caption("Rule: brand count turns red when daily coverage for that brand is below 60% of total visits.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHOP DETAIL TABLE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_shop_brand_table(df, booker_filter=None, max_rows=200, missed_only=False, active_brands=None):
+    """
+    Per-shop table: unique visits count, last visit date, ✅/❌ per brand, coverage %, total NMV.
+    """
+    if df is None or df.empty:
+        st.info("No shop data available.")
+        return
+
+    priority_brands = list(active_brands or list(PRIORITY_BRANDS_CONFIG.keys()))
+    if not priority_brands:
+        st.info("Select at least one brand.")
+        return
+    d = df[df["booker_name"].isin(booker_filter)].copy() if booker_filter else df.copy()
+    d["visit_date"] = pd.to_datetime(d["visit_date"], errors="coerce").dt.normalize()
+
+    # Visit is date-based (not invoice-based): one row per shop per visit-date.
+    d_visit = (
+        d.sort_values(["store_code", "visit_date"])
+         .drop_duplicates(subset=["store_code", "visit_date"], keep="last")
+    )
+
+    last_v  = d_visit.sort_values("visit_date").groupby("store_code").last().reset_index()
+    v_count = d_visit.groupby("store_code")["visit_date"].nunique().rename("total_visits")
+    nmv_sum = d_visit.groupby("store_code")["total_nmv"].sum().rename("sum_nmv")
+
+    shop_df = (last_v.merge(v_count, on="store_code", how="left")
+                     .merge(nmv_sum,  on="store_code", how="left"))
+    shop_df["last_visit_str"] = shop_df["visit_date"].dt.strftime("%d-%b-%Y")
+
+    if missed_only:
+        miss_mask = pd.Series([False]*len(shop_df), index=shop_df.index)
+        for brand in priority_brands:
+            col = f"sold_{_brand_col(brand)}"
+            if col in shop_df.columns:
+                miss_mask |= ~shop_df[col].fillna(False).astype(bool)
+        shop_df = shop_df[miss_mask]
+
+    shop_df = shop_df.sort_values("sum_nmv", ascending=False).head(max_rows)
+    if shop_df.empty:
+        st.success("✅ All shops had all 3 brands on their last visit!")
+        return
+
+    rows = []
+    for _, r in shop_df.iterrows():
+        brand_cells = ""
+        missed = 0
+        for brand in priority_brands:
+            col  = f"sold_{_brand_col(brand)}"
+            sold = bool(r.get(col, False))
+            if not sold:
+                missed += 1
+            brand_cells += (f"<td style='text-align:center;padding:7px 6px;"
+                            f"font-size:16px;'>{'✅' if sold else '❌'}</td>")
+
+        cov_pct = (len(priority_brands) - missed) / len(priority_brands) * 100
+        cov_col = "#16A34A" if cov_pct >= 100 else "#D97706" if cov_pct >= 67 else "#DC2626"
+        rows.append(
+            "<tr style='border-bottom:1px solid #EEF2F7;'>"
+            f"<td style='padding:7px 10px;font-weight:600;color:#0F172A;"
+            f"max-width:170px;white-space:nowrap;overflow:hidden;"
+            f"text-overflow:ellipsis;font-size:12px;'>"
+            f"{escape(str(r.get('store_name',''))[:30])}</td>"
+            f"<td style='padding:7px 8px;color:#64748B;font-size:12px;"
+            f"text-align:center;'>{escape(str(r.get('booker_name',''))[:16])}</td>"
+            f"<td style='padding:7px 8px;color:#334155;font-size:12px;"
+            f"text-align:center;'>{int(r.get('total_visits',0)):,}</td>"
+            f"<td style='padding:7px 8px;color:#475569;font-size:12px;"
+            f"text-align:center;'>{r.get('last_visit_str','')}</td>"
+            + brand_cells +
+            f"<td style='padding:7px 8px;text-align:center;'>"
+            f"<span style='background:{cov_col}22;color:{cov_col};font-weight:700;"
+            f"border-radius:99px;padding:2px 8px;font-size:12px;'>{cov_pct:.0f}%</span>"
+            f"</td>"
+            f"<td style='padding:7px 8px;text-align:right;color:#334155;font-size:12px;'>"
+            f"Rs {float(r.get('sum_nmv',0))/1000:.1f}K</td>"
+            "</tr>"
+        )
+
+    bh = "".join([
+        f"<th style='padding:10px 6px;text-align:center;white-space:nowrap;'>"
+        f"{PRIORITY_BRANDS_CONFIG[b]['icon']} {b}</th>"
+        for b in priority_brands
+    ])
+    html = (
+        "<div style='border:1px solid #D9E3EF;border-radius:12px;overflow:hidden;"
+        "background:#FFFFFF;'>"
+        "<div style='max-height:480px;overflow:auto;'>"
+        "<table style='width:100%;border-collapse:collapse;font-size:12px;'>"
+        "<thead><tr style='background:#F8FAFC;color:#64748B;"
+        "text-transform:uppercase;font-size:11px;letter-spacing:.04em;"
+        "position:sticky;top:0;z-index:2;'>"
+        "<th style='padding:10px;text-align:left;'>Shop</th>"
+        "<th style='padding:10px;text-align:center;'>Booker</th>"
+        "<th style='padding:10px;text-align:center;'>Visits</th>"
+        "<th style='padding:10px;text-align:center;'>Last Visit</th>"
+        + bh +
+        "<th style='padding:10px;text-align:center;'>Coverage</th>"
+        "<th style='padding:10px;text-align:right;'>NMV</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table></div></div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
+    st.caption(
+        f"Showing top {len(shop_df):,} shops by NMV  |  "
+        "✅ sold on last visit  |  ❌ missed on last visit"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PER-BOOKER DRILL-DOWN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_booker_brand_detail(df, booker_name, active_brands=None):
+    """
+    Drill-down for one booker: sell rate per brand + recent visit log.
+    """
+    bdf = df[df["booker_name"] == booker_name].copy()
+    if bdf.empty:
+        st.info("No data for this booker.")
+        return
+
+    priority_brands = list(active_brands or list(PRIORITY_BRANDS_CONFIG.keys()))
+    if not priority_brands:
+        st.info("Select at least one brand.")
+        return
+    bdf["visit_date"] = pd.to_datetime(bdf["visit_date"], errors="coerce")
+
+    tv   = len(bdf)
+    a3   = int(bdf["all_3_brands"].sum())
+    a3p  = (a3/tv*100) if tv else 0
+    shops = bdf["store_code"].nunique()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Visits", f"{tv:,}")
+    c2.metric("Unique Shops", f"{shops:,}")
+    c3.metric("All-3-Brand Visits", f"{a3:,}")
+    c4.metric("All-3-Brand Coverage", f"{a3p:.1f}%")
+
+    # Per-brand sell rate cards
+    bc = st.columns(len(priority_brands))
+    for i, brand in enumerate(priority_brands):
+        col = f"sold_{_brand_col(brand)}"
+        sell_rate = bdf[col].mean() * 100 if col in bdf.columns else 0
+        cfg = _brand_style(brand)
+        brand_color = cfg.get("color", "#5B5F97")
+        brand_icon = cfg.get("icon", "")
+        bc[i].markdown(
+            f"<div style='text-align:center;padding:12px;"
+            f"background:{brand_color}15;border-radius:10px;'"
+            f"border:1px solid {brand_color}44;'>"
+            f"<div style='font-size:13px;color:#64748B;'>{brand_icon} {brand}</div>"
+            f"<div style='font-size:28px;font-weight:900;color:{brand_color};'>"
+            f"{sell_rate:.0f}%</div>"
+            f"<div style='font-size:11px;color:#94A3B8;'>sell rate</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    # Recent visits log
+    st.markdown("**Recent 50 Visits**")
+    recent = bdf.sort_values("visit_date", ascending=False).head(50)
+    rows = []
+    for _, r in recent.iterrows():
+        brand_cells_list = []
+        for b in priority_brands:
+            sold_col = f"sold_{_brand_col(b)}"
+            mark = "✅" if bool(r.get(sold_col, False)) else "❌"
+            brand_cells_list.append(
+                "<td style='text-align:center;padding:5px;font-size:14px;'>"
+                f"{mark}</td>"
+            )
+        brand_cells = "".join(brand_cells_list)
+        rows.append(
+            f"<tr style='border-bottom:1px solid #F1F5F9;'>"
+            f"<td style='padding:5px 8px;font-size:12px;'>"
+            f"{r['visit_date'].strftime('%d-%b') if pd.notna(r['visit_date']) else ''}</td>"
+            f"<td style='padding:5px 8px;font-size:12px;max-width:150px;"
+            f"white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>"
+            f"{escape(str(r.get('store_name',''))[:24])}</td>"
+            + brand_cells +
+            f"<td style='padding:5px 8px;font-size:11px;text-align:right;'>"
+            f"Rs {float(r.get('total_nmv',0))/1000:.1f}K</td>"
+            f"</tr>"
+        )
+    bh = "".join([
+        f"<th style='padding:8px 6px;text-align:center;'>"
+        f"{_brand_style(b)['icon']}</th>"
+        for b in priority_brands
+    ])
+    html = (
+        "<div style='max-height:320px;overflow:auto;border:1px solid #E2E8F0;"
+        "border-radius:10px;'>"
+        "<table style='width:100%;border-collapse:collapse;font-size:12px;'>"
+        "<thead><tr style='background:#F8FAFC;position:sticky;top:0;z-index:1;"
+        "font-size:10px;color:#64748B;text-transform:uppercase;'>"
+        "<th style='padding:8px;text-align:left;'>Date</th>"
+        "<th style='padding:8px;text-align:left;'>Shop</th>"
+        + bh +
+        "<th style='padding:8px;text-align:right;'>NMV</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table></div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN TAB RENDER FUNCTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_brand_coverage_tab(start_date, end_date, town_code):
+    """
+    CALL FROM MAIN():
+        with tab_brand_coverage:
+            render_brand_coverage_tab(start_date, end_date, town_code)
+    """
+    # Header
+    st.markdown(
+        """
+        <div style="background:linear-gradient(135deg,#064E3B 0%,#065F46 60%,#047857 100%);
+            border-radius:14px;padding:18px 26px;margin-bottom:14px;
+            box-shadow:0 4px 20px rgba(5,150,105,.25);">
+            <div style="font-size:22px;font-weight:900;color:#FFFFFF;">
+                🏪 Brand Coverage — Per Visit, Per Shop
+            </div>
+            <div style="font-size:13px;color:#A7F3D0;margin-top:4px;">
+                Har visit check ho rahi hai:
+                <b style="color:#FFF">☕ Tarang</b>,
+                <b style="color:#FFF">🥛 Olpers Milk</b> &amp;
+                <b style="color:#FFF">📦 Olpers TBA</b> biki ya nahi?
+                &nbsp;|&nbsp;
+                Visits: <code style="color:#D1FAE5">visits_summary_rows</code> &nbsp;|&nbsp;
+                Brand: <code style="color:#D1FAE5">sku_master.slug = '.Olper TBA'</code>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.spinner("Loading brand coverage data…"):
+        visit_df = build_visit_brand_coverage(start_date, end_date, town_code)
+        sales_brand_df = fetch_sales_with_brand(start_date, end_date, town_code)
+
+    if visit_df is None or visit_df.empty:
+        st.warning(
+            "No data found. Check that `visits_summary_rows` has data for this "
+            "period & distributor, and that `sku_master.slug` has '.Olper TBA' entries."
+        )
+        return
+
+    # Filters
+    all_bookers = sorted(visit_df["booker_name"].dropna().astype(str).unique().tolist())
+    available_focus_brands = list(PRIORITY_BRANDS_CONFIG.keys())
+    if sales_brand_df is not None and not sales_brand_df.empty and "brand_classified" in sales_brand_df.columns:
+        runtime_brands = (
+            sales_brand_df["brand_classified"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .replace("", np.nan)
+            .dropna()
+            .unique()
+            .tolist()
+        )
+        available_focus_brands = sorted(set(available_focus_brands + runtime_brands))
+    fc1, fc2, fc3, fc4 = st.columns([2.2, 1.5, 1, 1])
+    with fc1:
+        sel_bookers = st.multiselect("👤 Filter by Booker", options=all_bookers,
+                                     default=[], key="bc_booker_filter")
+    with fc2:
+        sel_focus_brands = st.multiselect(
+            "🏷️ Focus Brands",
+            options=available_focus_brands,
+            default=[b for b in PRIORITY_BRANDS_CONFIG.keys() if b in available_focus_brands],
+            key="bc_focus_brands",
+            help="Default 3 selected. Add/remove at runtime.",
+        )
+    with fc3:
+        max_rows = st.selectbox("Table rows", [50, 100, 200, 500], index=1, key="bc_rows")
+    with fc4:
+        missed_only = st.toggle("Missed shops only", False, key="bc_missed")
+
+    active_brands = [b for b in sel_focus_brands if b in available_focus_brands]
+    if not active_brands:
+        st.warning("Please select at least one Focus Brand.")
+        return
+
+    booker_filter = sel_bookers if sel_bookers else None
+    fdf = (visit_df[visit_df["booker_name"].isin(booker_filter)].copy()
+           if booker_filter else visit_df.copy())
+
+    active_sold_cols = [f"sold_{_brand_col(b)}" for b in active_brands if f"sold_{_brand_col(b)}" in fdf.columns]
+    if not active_sold_cols:
+        for b in active_brands:
+            fdf[f"sold_{_brand_col(b)}"] = False
+        active_sold_cols = [f"sold_{_brand_col(b)}" for b in active_brands]
+
+    fdf["brands_sold_count"] = fdf[active_sold_cols].sum(axis=1)
+    fdf["all_3_brands"] = fdf["brands_sold_count"] == len(active_brands)
+    fdf["coverage_score"] = (fdf["brands_sold_count"] / len(active_brands) * 100).round(1)
+
+    priority_brands = active_brands
+
+    # ── TOP KPIs ──────────────────────────────────────────────────────────────
+    tv   = len(fdf)
+    shops = fdf["store_code"].nunique()
+    a3   = int(fdf["all_3_brands"].sum())
+    a3p  = (a3/tv*100) if tv else 0
+
+    def _kpi_card(col, title, val, sub, grad):
+        col.markdown(
+            f"<div style='background:{grad};border-radius:12px;padding:14px 16px;"
+            f"box-shadow:0 2px 10px rgba(0,0,0,.15);'>"
+            f"<div style='font-size:11px;color:rgba(255,255,255,.8);"
+            f"text-transform:uppercase;letter-spacing:.08em;'>{title}</div>"
+            f"<div style='font-size:24px;font-weight:900;color:#FFF;margin:4px 0;'>{val}</div>"
+            f"<div style='font-size:11px;color:rgba(255,255,255,.75);'>{sub}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    kc = st.columns(3 + len(priority_brands))
+    _kpi_card(kc[0], "Total Visits", f"{tv:,}",
+              f"{shops:,} unique shops", "linear-gradient(135deg,#5B5F97,#8B8FD8)")
+    _kpi_card(kc[1], f"All-{len(priority_brands)}-Brand Visits", f"{a3:,}",
+              f"{a3p:.1f}% of visits", "linear-gradient(135deg,#16A34A,#34D399)")
+    _kpi_card(kc[2], "Missing 1+ Brand", f"{tv-a3:,}",
+              f"{100-a3p:.1f}% need attention", "linear-gradient(135deg,#DC2626,#F87171)")
+
+    for i, brand in enumerate(priority_brands):
+        col = f"sold_{_brand_col(brand)}"
+        bv  = int(fdf[col].sum()) if col in fdf.columns else 0
+        bpct = (bv/tv*100) if tv else 0
+        cfg = _brand_style(brand)
+        _kpi_card(kc[3+i], f"{cfg['icon']} {brand}", f"{bpct:.1f}%",
+                  f"{bv:,} visits", f"linear-gradient(135deg,{cfg['color']},{cfg['color']}99)")
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+    # ── ROW 1: Coverage Donut + Miss Rate Heatmap ─────────────────────────────
+    r1, r2 = st.columns([1, 1.6])
+    with r1:
+        st.plotly_chart(chart_coverage_donut(fdf, booker_filter, active_brands=priority_brands),
+                        use_container_width=True, key="bc_donut")
+    with r2:
+        st.plotly_chart(chart_miss_rate_heatmap(fdf, active_brands=priority_brands),
+                        use_container_width=True, key="bc_heatmap")
+
+    # ── ROW 2: Per-Booker Coverage Bars ──────────────────────────────────────
+    st.plotly_chart(chart_booker_brand_bar(fdf, active_brands=priority_brands),
+                    use_container_width=True, key="bc_booker_bar")
+
+    # ── ROW 2B: Sunburst + Shop Detail Table ────────────────────────────────
+    sun_col, sun_tbl_col = st.columns([1.45, 1])
+    with sun_col:
+        st.plotly_chart(
+            chart_daily_brand_shop_sunburst(
+                start_date,
+                end_date,
+                town_code,
+                booker_filter=booker_filter,
+                active_brands=priority_brands,
+                all_brands=available_focus_brands,
+            ),
+            use_container_width=True,
+            key="bc_daily_brand_shop_sunburst",
+        )
+    with sun_tbl_col:
+        st.markdown(
+            "<div style='font-size:15px;font-weight:700;color:#0F172A;margin:0 0 8px;'>"
+            "🏬 Sunburst Shop Detail</div>",
+            unsafe_allow_html=True,
+        )
+        render_sunburst_shop_detail_table(
+            fdf,
+            max_rows=int(max_rows),
+            active_brands=priority_brands,
+            all_brands=available_focus_brands,
+        )
+
+    # ── ROW 3: Daily Trend + Last Visit Gap ──────────────────────────────────
+    r3, r4 = st.columns([1.6, 1])
+    with r3:
+        st.plotly_chart(chart_daily_trend(fdf, booker_filter, active_brands=priority_brands),
+                        use_container_width=True, key="bc_trend")
+    with r4:
+        st.plotly_chart(chart_last_visit_gap(fdf, booker_filter, active_brands=priority_brands),
+                        use_container_width=True, key="bc_last")
+
+    # ── ROW 4: Daily Booker Coverage Matrix ─────────────────────────────────
+    st.markdown(
+        "<div style='font-size:16px;font-weight:700;color:#0F172A;margin:18px 0 8px;'>"
+        "📅 Daily Coverage Matrix (Booker x Date)</div>",
+        unsafe_allow_html=True,
+    )
+    render_daily_booker_coverage_matrix(
+        fdf,
+        active_brands=priority_brands,
+        max_bookers=60,
+        all_brands=available_focus_brands,
+    )
+
+    # ── SHOP TABLE ────────────────────────────────────────────────────────────
+    st.markdown(
+        "<div style='font-size:16px;font-weight:700;color:#0F172A;"
+        "margin:18px 0 8px;'>📋 Shop-wise Brand Coverage</div>",
+        unsafe_allow_html=True,
+    )
+    render_shop_brand_table(
+        fdf,
+        booker_filter,
+        max_rows=int(max_rows),
+        missed_only=missed_only,
+        active_brands=priority_brands,
+    )
+
+    # Export
+    exp_cols = (
+        ["store_code", "store_name", "booker_name", "visit_date",
+         "brands_sold_count", "all_3_brands", "coverage_score", "total_nmv"]
+        + [f"sold_{_brand_col(b)}" for b in priority_brands if f"sold_{_brand_col(b)}" in fdf.columns]
+    )
+    csv = (fdf[[c for c in exp_cols if c in fdf.columns]]
+           .sort_values("visit_date", ascending=False)
+           .to_csv(index=False).encode("utf-8"))
+    st.download_button("📥 Export Coverage CSV", data=csv,
+                       file_name=f"brand_coverage_{town_code}_{start_date}_to_{end_date}.csv",
+                       mime="text/csv", key="bc_export")
+
+    # ── BOOKER DRILL-DOWN ─────────────────────────────────────────────────────
+    st.markdown(
+        "<div style='font-size:16px;font-weight:700;color:#0F172A;"
+        "margin:18px 0 8px;'>🔍 Drill-Down: Per Booker Detail</div>",
+        unsafe_allow_html=True,
+    )
+    selected = st.selectbox("Select booker:", ["— select —"] + all_bookers,
+                             key="bc_drill")
+    if selected and selected != "— select —":
+        with st.expander(f"📊 {selected} — Visit × Shop × Brand", expanded=True):
+            render_booker_brand_detail(fdf, selected, active_brands=priority_brands)
+
+
+
+
+
+#####-----------------------------
+
+
+
+
 def main():
     # Check authentication
     check_authentication()
 
+    if st.session_state.get("post_login_query_params"):
+        try:
+            for key, value in st.session_state["post_login_query_params"].items():
+                st.query_params[key] = value
+        except Exception:
+            pass
+        st.session_state.post_login_query_params = None
+
     # Sidebar
     st.sidebar.title("⚙️ Settings")
-    st.sidebar.background_color = "#B8B8D1"
+    st.sidebar.background_color = "#EDF2EF"
 
     # Display username if available
     if st.session_state.get("username"):
@@ -5840,6 +8944,29 @@ def main():
     "D70002246": "Lahore",
     }.get(town_code, "Not Available")  # Default case in case of undefined town_code
 
+    query_params = st.query_params
+    view_mode = str(query_params.get("view", "")).strip().lower()
+    if view_mode == "outlets":
+        selected_booker = str(query_params.get("booker", "")).strip()
+        qp_start_raw = str(query_params.get("start", start_date)).strip()
+        qp_end_raw = str(query_params.get("end", end_date)).strip()
+        qp_town = str(query_params.get("town", town_code)).strip()
+
+        qp_start = pd.to_datetime(qp_start_raw, errors='coerce')
+        qp_end = pd.to_datetime(qp_end_raw, errors='coerce')
+        route_start = qp_start.date() if pd.notna(qp_start) else start_date
+        route_end = qp_end.date() if pd.notna(qp_end) else end_date
+        route_town = qp_town if qp_town in ["D70002202", "D70002246"] else town_code
+
+        if selected_booker:
+            render_booker_outlet_list_view(
+                selected_booker,
+                route_start,
+                route_end,
+                route_town,
+            )
+            return
+
     st.sidebar.subheader("🕒 Account Last Update")
     try:
         last_update_df = fetch_account_last_update_data()
@@ -5869,10 +8996,76 @@ def main():
 
     # st.balloons()
     # Main content
-    st.title(f"📊 Bazaar Prime Analytics Dashboard - {town}")
-    tab1,tab2,tab3,tab4,tab5,tab6=st.tabs(["📈 Sales Growth Analysis","🎯 Booker Performance","🧭 Booker & Field Force Deep Analysis","📦 Inventory","🧪 Custom Query","🤖 Bot Runner"])
+    top_header_title = escape(f"📊 Bazaar Prime Analytics Dashboard - {town}")
+    st.markdown(
+        f"""
+        <style>
+        .bp-top-header-title {{
+            position: fixed;
+            top: 0.72rem;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 999998;
+            font-size: 2.14rem;
+            font-weight: 700;
+            color: #0F172A;
+            line-height: 1.2;
+            pointer-events: none;
+            max-width: 70vw;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            text-align: center;
+        }}
+        @media (max-width: 900px) {{
+            .bp-top-header-title {{
+                font-size: 0.98rem;
+                max-width: 62vw;
+            }}
+        }}
+        </style>
+        <div class="bp-top-header-title">{top_header_title}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    missing_data_has_issue = False
+    try:
+        unknown_brand_alert_df = fetch_unknown_brand_sku_data(start_date, end_date, town_code)
+        missing_target_alert_df = fetch_current_month_missing_targets_from_sales(town_code)
+        missing_shop_alert_df = fetch_missing_shops_from_universe(start_date, end_date, town_code)
+        target_status_alert_df = fetch_current_month_target_status(town_code)
+
+        target_rows_alert = 0
+        if target_status_alert_df is not None and not target_status_alert_df.empty:
+            target_rows_alert = int(pd.to_numeric(target_status_alert_df.iloc[0].get("target_rows", 0), errors="coerce") or 0)
+
+        missing_data_has_issue = any([
+            unknown_brand_alert_df is not None and not unknown_brand_alert_df.empty,
+            target_rows_alert <= 0,
+            missing_target_alert_df is not None and not missing_target_alert_df.empty,
+            missing_shop_alert_df is not None and not missing_shop_alert_df.empty,
+        ])
+    except Exception:
+        missing_data_has_issue = True
+
+    missing_tab_label = "🔴 🧩 Missing Data" if missing_data_has_issue else "🧩 Missing Data"
+    tab_summary,tab1,tab2,tab3,tab4,tab5,tab6,tab7=st.tabs(["🗂️ Summary","📈 Sales Growth Analysis","🎯 Booker Performance","🧭 Booker & Field Force Deep Analysis","📦 Inventory","🧪 Custom Query","🤖 Bot Runner",missing_tab_label])
+    
+    with tab_summary:
+             render_summary_tab_content(start_date, end_date, town_code, town)
+             render_brand_coverage_tab(start_date, end_date, town_code)
     with tab1:
     # KPIs
+        metric_top_col1, metric_top_col2 = st.columns([6, 1])
+        with metric_top_col2:
+            tab_metric_filter = "Ltr" if st.toggle(
+                "Ltr Metric",
+                value=False,
+                key="tab1_global_metric_toggle",
+                help="Applies to all metric-based charts in this tab"
+            ) else "Value"
+
         st.subheader("📈 Key Performance Indicator")
         kpi_data = fetch_kpi_data(start_date, end_date, town_code)
 
@@ -5916,23 +9109,23 @@ def main():
         # Display KPIs in centered container with equal widths
             empty1, col1, col2, col3, col4, empty2 = st.columns([0.5, 2, 2, 2, 2, 0.5])
 
-            rev_ly_text = f"{'▲' if revenue_growth_ly >= 0 else '▼'} {abs(revenue_growth_ly):.2f}% vs Last Year"
-            rev_lm_text = f"{'▲' if revenue_growth_lm >= 0 else '▼'} {abs(revenue_growth_lm):.2f}% vs Last Month"
+            rev_ly_text = f"{'▲' if revenue_growth_ly >= 0 else '▼'} {abs(revenue_growth_ly):.2f}% vs LY"
+            rev_lm_text = f"{'▲' if revenue_growth_lm >= 0 else '▼'} {abs(revenue_growth_lm):.2f}% vs LM"
             rev_ly_color = '#16A34A' if revenue_growth_ly >= 0 else '#DC2626'
             rev_lm_color = '#16A34A' if revenue_growth_lm >= 0 else '#DC2626'
 
-            ltr_ly_text = f"{'▲' if ltr_growth_ly >= 0 else '▼'} {abs(ltr_growth_ly):.2f}% vs Last Year"
-            ltr_lm_text = f"{'▲' if ltr_growth_lm >= 0 else '▼'} {abs(ltr_growth_lm):.2f}% vs Last Month"
+            ltr_ly_text = f"{'▲' if ltr_growth_ly >= 0 else '▼'} {abs(ltr_growth_ly):.2f}% vs LY"
+            ltr_lm_text = f"{'▲' if ltr_growth_lm >= 0 else '▼'} {abs(ltr_growth_lm):.2f}% vs LM"
             ltr_ly_color = '#16A34A' if ltr_growth_ly >= 0 else '#DC2626'
             ltr_lm_color = '#16A34A' if ltr_growth_lm >= 0 else '#DC2626'
 
-            ord_ly_text = f"{'▲' if orders_growth_ly >= 0 else '▼'} {abs(orders_growth_ly):.2f}% vs Last Year"
-            ord_lm_text = f"{'▲' if orders_growth_lm >= 0 else '▼'} {abs(orders_growth_lm):.2f}% vs Last Month"
+            ord_ly_text = f"{'▲' if orders_growth_ly >= 0 else '▼'} {abs(orders_growth_ly):.2f}% vs LY"
+            ord_lm_text = f"{'▲' if orders_growth_lm >= 0 else '▼'} {abs(orders_growth_lm):.2f}% vs LM"
             ord_ly_color = '#16A34A' if orders_growth_ly >= 0 else '#DC2626'
             ord_lm_color = '#16A34A' if orders_growth_lm >= 0 else '#DC2626'
 
-            aov_ly_text = f"{'▲' if aov_growth_ly >= 0 else '▼'} {abs(aov_growth_ly):.2f}% vs Last Year"
-            aov_lm_text = f"{'▲' if aov_growth_lm >= 0 else '▼'} {abs(aov_growth_lm):.2f}% vs Last Month"
+            aov_ly_text = f"{'▲' if aov_growth_ly >= 0 else '▼'} {abs(aov_growth_ly):.2f}% vs LY"
+            aov_lm_text = f"{'▲' if aov_growth_lm >= 0 else '▼'} {abs(aov_growth_lm):.2f}% vs LM"
             aov_ly_color = '#16A34A' if aov_growth_ly >= 0 else '#DC2626'
             aov_lm_color = '#16A34A' if aov_growth_lm >= 0 else '#DC2626'
 
@@ -6070,15 +9263,16 @@ def main():
                                 aov_display = f"Rs {aov_val:.2f}"
                         with col:
                                 render_unified_kpi_card(
-                                    label=f"🛍️ {str(r['Channel'])}",
+                                    label=f"{str(r['Channel'])}",
                                     value=aov_display,
                                     line_gradient=channel_gradients[idx % len(channel_gradients)],
-                                    delta_primary=f"{growth_ly_arrow} {abs(growth_ly):.2f}% vs Last Year",
+                                    delta_primary=f"{growth_ly_arrow} {abs(growth_ly):.2f}% vs LY",
                                     delta_primary_color=growth_ly_color,
-                                    delta_secondary=f"{growth_lm_arrow} {abs(growth_lm):.2f}% vs Last Month",
+                                    delta_secondary=f"{growth_lm_arrow} {abs(growth_lm):.2f}% vs LM",
                                     delta_secondary_color=growth_lm_color,
                                 )
         # Booker Analysis Section
+
         #channel wise sales performance chart
         st.markdown("---")
         st.subheader(f"📊 Channel-wise Performance Comparison")
@@ -6087,34 +9281,34 @@ def main():
         #channel wise growth percentage chart
         leftcol,right_col = st.columns([1.5,1])
         with leftcol:
-                col1, col2, col3 = st.columns([1, 2, 1])
-                with col3:
-                    metric_filter = st.radio(
-                        "Select Metric",
-                        options=['Value', 'Ltr'],
-                        horizontal=True,
-                        help="Toggle between Sales Value and Litres comparison"
-                    )
-            
                 channel_perf_df = Channelwise_performance_data(start_date, end_date, town_code)
-                st.plotly_chart(create_Channel_performance_chart(channel_perf_df, metric_type=metric_filter), use_container_width=True, key="channel_performance_chart")
+                st.plotly_chart(create_Channel_performance_chart(channel_perf_df, metric_type=tab_metric_filter), use_container_width=True, key="channel_performance_chart")
 
         with right_col:
-            col1, col2, col3 = st.columns([1, 2, 1])
-            with col2:
-                metric_filter = st.radio(
-                    "Select Metric",
-                    options=['Value', 'Ltr'],
-                    horizontal=True,
-                    help="Toggle between Sales Value and Litres growth comparison"
+            col1, col2, col3 = st.columns([1, 1, 1])
+            with col1:
+                channel_growth_lm = st.toggle(
+                    "vs LM",
+                    value=False,
+                    key="channel_growth_basis_toggle",
+                    help="ON = compare growth vs Last Month, OFF = vs Last Year"
                 )
+                channel_growth_basis = "LM" if channel_growth_lm else "LY"
 
             channel_growth_df = Channelwise_performance_data(start_date, end_date, town_code)
-            st.plotly_chart(create_channel_wise_growth_chart(channel_growth_df, metric_type=metric_filter), use_container_width=True, key="channel_growth_chart")
+            st.plotly_chart(
+                create_channel_wise_growth_chart(
+                    channel_growth_df,
+                    metric_type=tab_metric_filter,
+                    growth_basis=channel_growth_basis,
+                ),
+                use_container_width=True,
+                key="channel_growth_chart"
+            )
             # brand wise growth percentage chart
         st.markdown("---")
         st.subheader(f"📈 Brand-wise Growth Percentage")
-        col1, col2, col3 = st.columns([1, 2, 1])
+        col1, col2 = st.columns([1, 2])
         with col2:
             brand_channel_options_df = fetch_brand_growth_channel_options(start_date, end_date, town_code)
             brand_channel_options = ["All"]
@@ -6132,14 +9326,6 @@ def main():
                 options=brand_channel_options,
                 index=0,
                 key="brand_growth_channel_filter"
-            )
-
-        with col3:
-            metric_filter = st.radio(
-                "Select Metric for Brand Growth",
-                options=['Value', 'Ltr'],
-                horizontal=True,
-                help="Toggle between Sales Value and Litres growth comparison"
             )
 
         with col1:
@@ -6160,104 +9346,98 @@ def main():
         brand_growth_left, brand_growth_right = st.columns(2)
         with brand_growth_left:
             st.plotly_chart(
-                create_brand_wise_growth_chart(brand_growth_df, metric_type=metric_filter),
+                create_brand_wise_growth_chart(brand_growth_df, metric_type=tab_metric_filter),
                 use_container_width=True,
                 key="brand_growth_bar_chart"
             )
         with brand_growth_right:
             st.plotly_chart(
-                create_brand_wise_growth_segmented_chart(brand_growth_df, metric_type=metric_filter),
+                create_brand_wise_growth_segmented_chart(brand_growth_df, metric_type=tab_metric_filter),
                 use_container_width=True,
                 key="brand_growth_segmented_chart"
             )
         # DM wise growth percentage chart
-        st.markdown("---")
-        st.subheader(f"📈 Deliveryman-wise Growth Percentage")
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col3:
-            metric_filter = st.radio(
-                "Select Metric for Deliveryman Growth",
-                options=['Value', 'Ltr'],
-                horizontal=True,
-                help="Toggle between Sales Value and Litres growth comparison"
+        # st.markdown("---")
+        # st.subheader(f"📈 Deliveryman-wise Growth Percentage")
+        dm_growth_left_col, dm_growth_right_col = st.columns(2)
+
+        with dm_growth_left_col:
+            col1, col2, col3 = st.columns([1, 1, 1])
+            with col3:
+                growth_basis_is_lm = st.toggle(
+                    "vs LM",
+                    value=False,
+                    key="dm_growth_basis_toggle",
+                    help="ON = compare growth vs Last Month, OFF = vs Last Year"
+                )
+                growth_basis = "LM" if growth_basis_is_lm else "LY"
+
+            dm_growth_df = dm_wise_performance_growth_data(start_date, end_date, town_code)
+            dm_order_growth_col = (
+                "Sales_Growth_LM" if tab_metric_filter == "Value" and growth_basis == "LM" else
+                "Sales_Growth_LY" if tab_metric_filter == "Value" else
+                "Ltr_Growth_LM" if growth_basis == "LM" else
+                "Ltr_Growth_LY"
+            )
+            dm_order_df = dm_growth_df[["DeliveryMan", dm_order_growth_col]].copy() if dm_growth_df is not None and not dm_growth_df.empty else pd.DataFrame(columns=["DeliveryMan", dm_order_growth_col])
+            if not dm_order_df.empty:
+                dm_order_df[dm_order_growth_col] = pd.to_numeric(dm_order_df[dm_order_growth_col], errors='coerce').fillna(0)
+                dm_order_df["DeliveryMan"] = dm_order_df["DeliveryMan"].astype(str)
+                dm_order_df = dm_order_df.sort_values(dm_order_growth_col, ascending=False)
+                dm_shared_order = dm_order_df["DeliveryMan"].tolist()
+            else:
+                dm_shared_order = []
+
+            st.plotly_chart(
+                create_dm_wise_growth_chart(
+                    dm_growth_df,
+                    metric_type=tab_metric_filter,
+                    growth_basis=growth_basis,
+                    deliveryman_order=dm_shared_order,
+                ),
+                use_container_width=True,
+                key="dm_growth_chart"
             )
 
-        dm_growth_df = dm_wise_performance_growth_data(start_date, end_date, town_code)
-        st.plotly_chart(create_dm_wise_growth_chart(dm_growth_df, metric_type=metric_filter), use_container_width=True, key="dm_growth_chart")
+        with dm_growth_right_col:
+            col1, col2, col3 = st.columns([1, 1, 1])
+            with col3:
+                unique_prod_growth_is_lm = st.toggle(
+                    "vs LM",
+                    value=False,
+                    key="dm_unique_prod_growth_basis_toggle",
+                    help="ON = compare unique productivity growth vs Last Month, OFF = vs Last Year"
+                )
+                unique_prod_growth_basis = "LM" if unique_prod_growth_is_lm else "LY"
+
+            dm_unique_prod_df = dm_wise_unique_productivity_growth_data(start_date, end_date, town_code)
+            st.plotly_chart(
+                create_dm_unique_productivity_growth_chart(
+                    dm_unique_prod_df,
+                    growth_basis=unique_prod_growth_basis,
+                    deliveryman_order=dm_shared_order,
+                ),
+                use_container_width=True,
+                key="dm_unique_productivity_growth_chart"
+            )
         #target vs achievement comparison chart
         st.markdown("---")
         
         st.subheader(f"🎯 Target vs Achievement Comparison")
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col3:
-            metric_filter = st.radio(
-                "Select Metric for Target vs Achievement",
-                options=['Value', 'Ltr'],
-                horizontal=True,
-                help="Toggle between Sales Value and Litres comparison"
-            )
         tgt_vs_ach_df = tgtvsach_YTD_data(town_code)
-        st.plotly_chart(create_target_achievement_chart(tgt_vs_ach_df, metric_type=metric_filter), use_container_width=True,key="target_achievement_chart")
+        st.plotly_chart(create_target_achievement_chart(tgt_vs_ach_df, metric_type=tab_metric_filter), use_container_width=True,key="target_achievement_chart")
         
-        # Channel DM Sunburst chart
-        st.markdown("---")
-        st.subheader(f"🌐 Channel DM Sunburst Chart")
-
-        sunburst_df = fetch_Channel_dm_sunburst_data(start_date, end_date, town_code)
-        if sunburst_df is None:
-            sunburst_df = pd.DataFrame()
-
-        if not sunburst_df.empty:
-            sunburst_df["Channel"] = sunburst_df["Channel"].fillna("Unknown Channel")
-            sunburst_df["Brand"] = sunburst_df["Brand"].fillna("Unknown Brand")
-            sunburst_df["DM"] = sunburst_df["DM"].fillna("Unknown DM")
-
-        sunburst_dm_values = sorted(sunburst_df['DM'].dropna().astype(str).unique().tolist()) if not sunburst_df.empty and 'DM' in sunburst_df.columns else []
-        sunbrust_channel_values= sorted(sunburst_df['Channel'].dropna().astype(str).unique().tolist()) if not sunburst_df.empty and 'Channel' in sunburst_df.columns else []
-        
-        
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col3:
-            selected_sunburst_dms = st.multiselect(
-                "Filter Deliverymen for Sunburst",
-                options=sunburst_dm_values,
-                default=[],
-            )
-        with col2:
-            selected_sunburst_channels = st.multiselect(
-                "Filter Channels for Sunburst",
-                options=sunbrust_channel_values,
-                default=[],
-            )
-
-        left_col, right_col = st.columns([1.5, 1])
-        with left_col:
-            st.plotly_chart(
-                create_Channel_dm_sunburst(sunburst_df, selected_dms=selected_sunburst_dms, selected_channels=selected_sunburst_channels),
-                use_container_width=True,
-                key="channel_dm_sunburst_chart"
-            )
-        with right_col:
-            st.plotly_chart(
-                brand_wise_productivity_chart(sunburst_df, selected_dms=selected_sunburst_dms, selected_channels=selected_sunburst_channels),
-                use_container_width=True,
-                key="brand_productivity_chart"
-            )
         st.markdown("---")
         st.subheader(f"📊 Target Achievement Heatmap by Booker and Period")
         left_col, right_col = st.columns([1.5, 1])
         with left_col:
-                col1, col2, col3 = st.columns([1, 2, 1])
-                with col3:
-                        metric_filter1 = st.radio(
-                "Select Metric",
-                options=['Value', 'Ltr'],
-                horizontal=True,
-                help="Toggle between Sales Value and Litres comparison",
-                key="heatmap_metric_filter"
-                )
-                heatmap_df = tgtvsach_YTD_heatmap_data(town_code)
-                st.plotly_chart(create_booker_period_heatmap(heatmap_df, metric_type=metric_filter1), use_container_width=True, key="booker_period_heatmap")
+            col1, col2, col3 = st.columns([1, 2, 1])
+            heatmap_df = tgtvsach_YTD_heatmap_data(town_code)
+            st.plotly_chart(
+                create_booker_period_heatmap(heatmap_df, metric_type=tab_metric_filter),
+                use_container_width=True,
+                key="booker_period_heatmap"
+            )
         with right_col:
                 col1, col2, col3 = st.columns([1, 2, 1])
                 col3.metric("", "")
@@ -6265,7 +9445,7 @@ def main():
             
                 channel_heatmap_df = tgtvsach_channelwise_heatmap(town_code)
                 st.plotly_chart(
-                create_channel_heatmap_YTD(channel_heatmap_df, metric_type=metric_filter1),
+                create_channel_heatmap_YTD(channel_heatmap_df, metric_type=tab_metric_filter),
                 use_container_width=True,
                 key="channel_performance_heatmap"
             )
@@ -6281,7 +9461,7 @@ def main():
             index=2
         )
 
-        pivot_df, detail_df = fetch_booker_less_ctn_data(months_back, town)
+        pivot_df, detail_df = fetch_booker_less_ctn_data(months_back, town_code)
 
         if not pivot_df.empty:
             # Format percentages
@@ -6386,27 +9566,32 @@ def main():
                 else:
                     st.caption(f"Channel: {selected_channel} | Rows: 0 for selected period")
             with right_col:
-                
                 render_achievement_band_legend()
-            st.plotly_chart(
-                create_tgtach_brand_maptree(
-                    treemap_df,
-                    achievement_below=selected_threshold,
-                    selected_brands=selected_brands
-                ),
-                use_container_width=True,
-                key="booker_treemap_chart"
-            )
+                hierarchy_brand_first = st.toggle(
+                    "Treemap Hierarchy: Brand → Booker",
+                    value=False,
+                    key="booker_treemap_hierarchy_toggle",
+                    help="OFF = Booker → Brand, ON = Brand → Booker"
+                )
 
-            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-            st.plotly_chart(
+            treemap_fig = (
                 create_tgtach_brand_booker_maptree(
                     treemap_df,
                     achievement_below=selected_threshold,
                     selected_brands=selected_brands
-                ),
+                )
+                if hierarchy_brand_first
+                else create_tgtach_brand_maptree(
+                    treemap_df,
+                    achievement_below=selected_threshold,
+                    selected_brands=selected_brands
+                )
+            )
+
+            st.plotly_chart(
+                treemap_fig,
                 use_container_width=True,
-                key="brand_booker_treemap_chart"
+                key="booker_treemap_chart"
             )
 
             st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
@@ -6825,8 +10010,19 @@ def main():
                                 'Last_Order_Date': 'Last Order Date',
                             })
 
+                            segmentation_view_df = table_df[['Shop Name', 'Segment', 'Orders In Period', 'Last Order Date']].copy()
+                            segmentation_csv_bytes = segmentation_view_df.to_csv(index=False).encode('utf-8')
+                            st.download_button(
+                                label="Export CSV",
+                                data=segmentation_csv_bytes,
+                                file_name="booker_segmentation_table.csv",
+                                mime="text/csv",
+                                key="deep_booker_seg_table_export_btn",
+                                disabled=segmentation_view_df.empty,
+                            )
+
                             render_booker_segmentation_table(
-                                table_df[['Shop Name', 'Segment', 'Orders In Period', 'Last Order Date']],
+                                segmentation_view_df,
                                 # height_px=480,
                                 
                             )
@@ -6972,113 +10168,6 @@ def main():
                         )
                         st.plotly_chart(detail_fig, use_container_width=True, key="deep_booker_brand_score_detail_chart")
 
-                    st.markdown(
-                        """
-                        <div style='font-size:14px;font-weight:700;color:#0F172A;'>
-                            Booker-wise Low Focus Brand Summary
-                            <span title='Low-focus brands are those with contribution <= threshold, plus zero-sale brands for that booker.' style='cursor:help; margin-left:6px; color:#64748B;'>?</span>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-                    low_focus_threshold = st.slider(
-                        "Low Focus Threshold (%)",
-                        min_value=0.0,
-                        max_value=20.0,
-                        value=5.0,
-                        step=0.5,
-                        key="deep_low_focus_brand_threshold",
-                        help="Brand score <= threshold will be considered low focus; zero-sale brands are also included."
-                    )
-
-                    all_brands = sorted(score_df['Brand'].dropna().astype(str).unique().tolist())
-                    summary_rows = []
-                    for booker_name, grp in score_df.groupby('Booker', as_index=False):
-                        grp = grp.copy()
-                        sold_brands = set(grp['Brand'].astype(str).tolist())
-                        grp['Brand_Score'] = pd.to_numeric(grp.get('Brand_Score', 0), errors='coerce').fillna(0)
-                        brand_score_map = {
-                            str(item['Brand']): float(item['Brand_Score'])
-                            for _, item in grp[['Brand', 'Brand_Score']].iterrows()
-                        }
-
-                        low_score_brands = set(
-                            grp.loc[grp['Brand_Score'] <= float(low_focus_threshold), 'Brand'].astype(str).tolist()
-                        )
-                        zero_sale_brands = set(all_brands) - sold_brands
-
-                        no_focus_brand_items = []
-                        for brand in low_score_brands:
-                            no_focus_brand_items.append((str(brand), float(brand_score_map.get(str(brand), 0.0))))
-                        for brand in zero_sale_brands:
-                            no_focus_brand_items.append((str(brand), 0.0))
-
-                        no_focus_brand_items = list(dict.fromkeys(no_focus_brand_items))
-                        no_focus_brand_items = sorted(no_focus_brand_items, key=lambda item: (item[1], item[0]))
-
-                        summary_rows.append({
-                            'Booker': str(booker_name),
-                            'Low Focus Brand Count': int(len(no_focus_brand_items)),
-                            'Low Focus Brand List': no_focus_brand_items,
-                        })
-
-                    low_focus_summary_df = pd.DataFrame(summary_rows).sort_values(
-                        ['Low Focus Brand Count', 'Booker'], ascending=[False, True]
-                    )
-
-                    st.caption("Chip Color Guide: Grey = 0% | Red = <=2% | Amber = <=5% | Green = >5% (if included by threshold)")
-
-                    rows_html = []
-                    def _chip_style(score_value):
-                        if score_value <= 0:
-                            return '#F1F5F9', '#475569', '#CBD5E1'
-                        if score_value <= 2:
-                            return '#FEE2E2', '#991B1B', '#FCA5A5'
-                        if score_value <= 5:
-                            return '#FEF3C7', '#92400E', '#FCD34D'
-                        return '#DCFCE7', '#166534', '#86EFAC'
-
-                    for _, row in low_focus_summary_df.iterrows():
-                        booker_name = escape(str(row.get('Booker', '')))
-                        brand_count = int(row.get('Low Focus Brand Count', 0))
-                        brand_list = row.get('Low Focus Brand List', [])
-                        if isinstance(brand_list, list) and brand_list:
-                            chip_items = []
-                            for brand_item in brand_list:
-                                if isinstance(brand_item, tuple) and len(brand_item) == 2:
-                                    brand_name, brand_score = brand_item
-                                else:
-                                    brand_name, brand_score = str(brand_item), 0.0
-                                chip_bg, chip_text, chip_border = _chip_style(float(brand_score))
-                                chip_items.append(
-                                    f"<span title='Contribution: {float(brand_score):.1f}%' style='display:inline-block;background:{chip_bg};color:{chip_text};border:1px solid {chip_border};border-radius:999px;padding:3px 8px;font-size:11px;font-weight:600;line-height:1.2;'>{escape(str(brand_name))}</span>"
-                                )
-                            chips_html = "".join(chip_items)
-                        else:
-                            chips_html = "<span style='color:#94A3B8;'>-</span>"
-
-                        rows_html.append(
-                            "<tr style='border-bottom:1px solid #EEF2F7;'>"
-                            f"<td style='padding:8px 10px;color:#0F172A;font-size:12px;font-weight:600;white-space:nowrap;'>{booker_name}</td>"
-                            f"<td style='padding:8px 10px;color:#334155;font-size:12px;text-align:right;white-space:nowrap;'>{brand_count}</td>"
-                            f"<td style='padding:8px 10px;'><div style='display:flex;flex-wrap:wrap;gap:6px;'>{chips_html}</div></td>"
-                            "</tr>"
-                        )
-
-                    low_focus_table_html = (
-                        "<div style='border:1px solid #D9E3EF;border-radius:12px;background:#FFFFFF;overflow:hidden;'>"
-                        "<div style='max-height:260px;overflow:auto;'>"
-                        "<table style='width:100%;border-collapse:separate;border-spacing:0;'>"
-                        "<thead><tr>"
-                        "<th title='Order Booker Name' style='position:sticky;top:0;z-index:2;background:#F8FAFC;border-bottom:1px solid #E2E8F0;padding:8px 10px;text-align:left;color:#334155;font-size:12px;'>Booker</th>"
-                        "<th title='Number of brands considered low/no focus for this booker' style='position:sticky;top:0;z-index:2;background:#F8FAFC;border-bottom:1px solid #E2E8F0;padding:8px 10px;text-align:right;color:#334155;font-size:12px;'>Low Focus Brand Count</th>"
-                        "<th title='Colored chips represent contribution level; hover a chip for exact contribution %' style='position:sticky;top:0;z-index:2;background:#F8FAFC;border-bottom:1px solid #E2E8F0;padding:8px 10px;text-align:left;color:#334155;font-size:12px;'>Low Focus Brands</th>"
-                        "</tr></thead>"
-                        f"<tbody>{''.join(rows_html)}</tbody>"
-                        "</table></div></div>"
-                    )
-                    st.markdown(low_focus_table_html, unsafe_allow_html=True)
-
                 calls_kpi_df = daily_calls_df.copy() if daily_calls_df is not None else pd.DataFrame()
                 if calls_kpi_df is not None and not calls_kpi_df.empty and selected_deep_bookers:
                     calls_kpi_df = calls_kpi_df[calls_kpi_df['Booker'].astype(str).isin([str(booker) for booker in selected_deep_bookers])]
@@ -7095,7 +10184,7 @@ def main():
                     productive = pd.to_numeric(frame.get('Productive_Calls', 0), errors='coerce').fillna(0).sum()
                     call_days = pd.to_datetime(frame.get('Call_Date'), errors='coerce').dropna().nunique()
 
-                    strike_rate = (executed / planned * 100) if planned > 0 else 0.0
+                    strike_rate = (productive / planned * 100) if planned > 0 else 0.0
                     calls_day = (planned / call_days) if call_days > 0 else 0.0
                     productive_pct = (productive / planned * 100) if planned > 0 else 0.0
                     return {
@@ -7195,7 +10284,7 @@ def main():
                             value=f"{curr_calls_metrics['avg_strike_rate']:.1f}%",
                             delta_primary=strike_delta_text,
                             delta_primary_color=strike_delta_color,
-                            tooltip='(Executed Calls / Planned Calls) × 100',
+                            tooltip='(Productive Calls / Planned Calls) × 100',
                             line_gradient='linear-gradient(90deg, #06B6D4, #38BDF8)'
                         )
                     with call_kpi_col2:
@@ -7393,7 +10482,7 @@ def main():
             avg_days_cover = float(curr.get('avg_days_cover', 0.0) or 0.0)
             slow_movers = int(curr.get('slow_movers', 0) or 0)
 
-            inventory_sparkline = fetch_inventory_ytd_month_end_sparkline(end_date, town_code)
+            inventory_sparkline = fetch_inventory_last_12_month_end_sparkline(end_date, town_code)
 
             total_skus_delta, total_skus_color = _delta_text(total_skus, prev.get('total_skus'), unit_suffix="")
             current_inventory_delta, current_inventory_color = _delta_text(
@@ -7464,8 +10553,8 @@ def main():
 
             latest_dt = inventory_data.get('latest_report_date')
             prev_dt = inventory_data.get('prev_report_date')
-            if latest_dt:
-                st.caption(f"Stock snapshot date: {latest_dt} | Comparison base: {prev_dt if prev_dt else '-'}")
+            # if latest_dt:
+                # st.caption(f"Stock snapshot date: {latest_dt} | Comparison base: {prev_dt if prev_dt else '-'}")
 
             chart_data = fetch_inventory_chart_data(end_date, town_code)
             trend_df = chart_data.get('trend', pd.DataFrame())
@@ -8033,9 +11122,8 @@ def main():
 
         if not expected_bot_tab_password:
             st.error("Bot Runner password is not configured. Set BOT_RUNNER_PASSWORD in secrets or environment.")
-            st.stop()
 
-        if not st.session_state.get("bot_runner_unlocked"):
+        if expected_bot_tab_password and not st.session_state.get("bot_runner_unlocked"):
             gate_col1, gate_col2 = st.columns([2, 1])
             with gate_col1:
                 bot_runner_password_input = st.text_input(
@@ -8054,143 +11142,222 @@ def main():
                         st.error("Invalid Bot Runner password.")
 
             st.info("This tab is password protected.")
-            st.stop()
+        if expected_bot_tab_password and st.session_state.get("bot_runner_unlocked"):
+            lock_col1, _ = st.columns([1, 5])
+            with lock_col1:
+                if st.button("🔒 Lock", key="bot_runner_lock_btn"):
+                    st.session_state["bot_runner_unlocked"] = False
+                    st.rerun()
 
-        lock_col1, _ = st.columns([1, 5])
-        with lock_col1:
-            if st.button("🔒 Lock", key="bot_runner_lock_btn"):
-                st.session_state["bot_runner_unlocked"] = False
-                st.rerun()
+            if "bot_runner_pid" not in st.session_state:
+                st.session_state["bot_runner_pid"] = None
+            if "bot_open_live_popup" not in st.session_state:
+                st.session_state["bot_open_live_popup"] = False
+            if "bot_runner_log_path" not in st.session_state:
+                st.session_state["bot_runner_log_path"] = _get_primary_bot_log_path()
+            if "bot_runner_log_start_pos" not in st.session_state:
+                st.session_state["bot_runner_log_start_pos"] = 0
 
-        if "bot_runner_pid" not in st.session_state:
-            st.session_state["bot_runner_pid"] = None
-        if "bot_open_live_popup" not in st.session_state:
-            st.session_state["bot_open_live_popup"] = False
-        if "bot_runner_log_path" not in st.session_state:
-            st.session_state["bot_runner_log_path"] = _get_primary_bot_log_path()
-        if "bot_runner_log_start_pos" not in st.session_state:
-            st.session_state["bot_runner_log_start_pos"] = 0
+            current_pid = st.session_state.get("bot_runner_pid")
+            is_running = _is_pid_running(current_pid)
+            if not is_running and current_pid is not None:
+                st.session_state["bot_runner_pid"] = None
 
-        current_pid = st.session_state.get("bot_runner_pid")
-        is_running = _is_pid_running(current_pid)
-        if not is_running and current_pid is not None:
-            st.session_state["bot_runner_pid"] = None
-
-        ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([1, 1, 1, 3])
-        with ctrl_col1:
-            if st.button("▶️ Start Bot", key="bot_runner_start_btn", type="primary"):
-                if is_running:
-                    st.warning(f"Bot is already running (PID: {current_pid}).")
-                    st.session_state["bot_open_live_popup"] = True
-                else:
-                    try:
-                        current_log_path = _get_primary_bot_log_path()
-                        current_log_start = _safe_file_size(current_log_path)
-                        new_pid = _start_bot_process(extra_env=_get_bot_runtime_env())
-                        st.session_state["bot_runner_pid"] = int(new_pid)
-                        st.session_state["bot_runner_log_path"] = current_log_path
-                        st.session_state["bot_runner_log_start_pos"] = int(current_log_start)
+            ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([1, 1, 1, 3])
+            with ctrl_col1:
+                if st.button("▶️ Start Bot", key="bot_runner_start_btn", type="primary"):
+                    if is_running:
+                        st.warning(f"Bot is already running (PID: {current_pid}).")
                         st.session_state["bot_open_live_popup"] = True
-                        st.success(f"Bot started successfully (PID: {new_pid}).")
-                    except Exception as bot_start_exc:
-                        st.error(f"Could not start bot: {bot_start_exc}")
-
-        with ctrl_col2:
-            if st.button("⏹ Stop Bot", key="bot_runner_stop_btn"):
-                active_pid = st.session_state.get("bot_runner_pid")
-                if _is_pid_running(active_pid):
-                    stopped = _stop_pid(active_pid)
-                    if stopped:
-                        st.session_state["bot_runner_pid"] = None
-                        st.session_state["bot_open_live_popup"] = False
-                        st.session_state["bot_runner_log_start_pos"] = 0
-                        st.success(f"Bot stopped (PID: {active_pid}).")
-                    else:
-                        st.error(f"Could not stop bot PID: {active_pid}")
-                else:
-                    st.info("Bot is not running.")
-
-        with ctrl_col3:
-            if st.button("🔄 Refresh Logs", key="bot_runner_refresh_btn"):
-                st.rerun()
-
-        with ctrl_col4:
-            if _is_pid_running(st.session_state.get("bot_runner_pid")):
-                st.success(f"Status: Running | PID: {st.session_state.get('bot_runner_pid')}")
-            else:
-                st.info("Status: Not Running")
-
-        st.markdown("### 🔄 Refresh Data (Selected Period)")
-        st.caption(f"Selected period: {start_date} to {end_date}")
-        refresh_col1, refresh_col2, refresh_col3 = st.columns([2, 1, 3])
-        with refresh_col1:
-            refresh_password_input = st.text_input(
-                "RefreshData Password",
-                type="password",
-                key="bot_refresh_data_password_input",
-                help="Required to run refresh for selected period."
-            )
-        with refresh_col2:
-            st.markdown("<div style='height: 1.85rem;'></div>", unsafe_allow_html=True)
-            if st.button("🔁 RefreshData", key="bot_refresh_data_btn"):
-                if _is_pid_running(st.session_state.get("bot_runner_pid")):
-                    st.warning("Bot is already running. Stop it first, then run RefreshData.")
-                else:
-                    expected_password = _get_refresh_data_password()
-                    if not expected_password:
-                        st.error("Refresh password is not configured. Set REFRESH_DATA_PASSWORD in secrets or environment.")
-                    elif str(refresh_password_input or "") != expected_password:
-                        st.error("Invalid refresh password.")
                     else:
                         try:
                             current_log_path = _get_primary_bot_log_path()
                             current_log_start = _safe_file_size(current_log_path)
-                            refresh_env = _get_bot_runtime_env()
-                            refresh_env.update(
-                                {
-                                    "FORCE_START_DATE": str(start_date),
-                                    "FORCE_END_DATE": str(end_date),
-                                }
-                            )
-                            new_pid = _start_bot_process(
-                                extra_env=refresh_env
-                            )
+                            new_pid = _start_bot_process(extra_env=_get_bot_runtime_env())
                             st.session_state["bot_runner_pid"] = int(new_pid)
                             st.session_state["bot_runner_log_path"] = current_log_path
                             st.session_state["bot_runner_log_start_pos"] = int(current_log_start)
                             st.session_state["bot_open_live_popup"] = True
-                            st.success(f"RefreshData started for {start_date} to {end_date} (PID: {new_pid}).")
-                        except Exception as refresh_exc:
-                            st.error(f"Could not start RefreshData: {refresh_exc}")
-        with refresh_col3:
-            st.caption("Runs bot for only selected period and updates DB rows for that range.")
+                            st.success(f"Bot started successfully (PID: {new_pid}).")
+                        except Exception as bot_start_exc:
+                            st.error(f"Could not start bot: {bot_start_exc}")
 
-        lines_to_show = st.slider(
-            "Log lines",
-            min_value=50,
-            max_value=1000,
-            value=250,
-            step=50,
-            key="bot_runner_log_lines"
-        )
+            with ctrl_col2:
+                if st.button("⏹ Stop Bot", key="bot_runner_stop_btn"):
+                    active_pid = st.session_state.get("bot_runner_pid")
+                    if _is_pid_running(active_pid):
+                        stopped = _stop_pid(active_pid)
+                        if stopped:
+                            st.session_state["bot_runner_pid"] = None
+                            st.session_state["bot_open_live_popup"] = False
+                            st.session_state["bot_runner_log_start_pos"] = 0
+                            st.success(f"Bot stopped (PID: {active_pid}).")
+                        else:
+                            st.error(f"Could not stop bot PID: {active_pid}")
+                    else:
+                        st.info("Bot is not running.")
 
-        logs_text, log_path = _read_bot_logs_tail(
-            max_lines=int(lines_to_show),
-            start_pos=st.session_state.get("bot_runner_log_start_pos", 0),
-            forced_log_path=st.session_state.get("bot_runner_log_path"),
-        )
-        if log_path:
-            st.caption(f"Log file: {log_path}")
+            with ctrl_col3:
+                if st.button("🔄 Refresh Logs", key="bot_runner_refresh_btn"):
+                    st.rerun()
+
+            with ctrl_col4:
+                if _is_pid_running(st.session_state.get("bot_runner_pid")):
+                    st.success(f"Status: Running | PID: {st.session_state.get('bot_runner_pid')}")
+                else:
+                    st.info("Status: Not Running")
+
+            st.markdown("### 🔄 Refresh Data (Selected Period)")
+            st.caption(f"Selected period: {start_date} to {end_date}")
+            refresh_col1, refresh_col2, refresh_col3 = st.columns([2, 1, 3])
+            with refresh_col1:
+                refresh_password_input = st.text_input(
+                    "RefreshData Password",
+                    type="password",
+                    key="bot_refresh_data_password_input",
+                    help="Required to run refresh for selected period."
+                )
+            with refresh_col2:
+                st.markdown("<div style='height: 1.85rem;'></div>", unsafe_allow_html=True)
+                if st.button("🔁 RefreshData", key="bot_refresh_data_btn"):
+                    if _is_pid_running(st.session_state.get("bot_runner_pid")):
+                        st.warning("Bot is already running. Stop it first, then run RefreshData.")
+                    else:
+                        expected_password = _get_refresh_data_password()
+                        if not expected_password:
+                            st.error("Refresh password is not configured. Set REFRESH_DATA_PASSWORD in secrets or environment.")
+                        elif str(refresh_password_input or "") != expected_password:
+                            st.error("Invalid refresh password.")
+                        else:
+                            try:
+                                current_log_path = _get_primary_bot_log_path()
+                                current_log_start = _safe_file_size(current_log_path)
+                                refresh_env = _get_bot_runtime_env()
+                                refresh_env.update(
+                                    {
+                                        "FORCE_START_DATE": str(start_date),
+                                        "FORCE_END_DATE": str(end_date),
+                                    }
+                                )
+                                new_pid = _start_bot_process(
+                                    extra_env=refresh_env
+                                )
+                                st.session_state["bot_runner_pid"] = int(new_pid)
+                                st.session_state["bot_runner_log_path"] = current_log_path
+                                st.session_state["bot_runner_log_start_pos"] = int(current_log_start)
+                                st.session_state["bot_open_live_popup"] = True
+                                st.success(f"RefreshData started for {start_date} to {end_date} (PID: {new_pid}).")
+                            except Exception as refresh_exc:
+                                st.error(f"Could not start RefreshData: {refresh_exc}")
+            with refresh_col3:
+                st.caption("Runs bot for only selected period and updates DB rows for that range.")
+
+            lines_to_show = st.slider(
+                "Log lines",
+                min_value=50,
+                max_value=1000,
+                value=250,
+                step=50,
+                key="bot_runner_log_lines"
+            )
+
+            logs_text, log_path = _read_bot_logs_tail(
+                max_lines=int(lines_to_show),
+                start_pos=st.session_state.get("bot_runner_log_start_pos", 0),
+                forced_log_path=st.session_state.get("bot_runner_log_path"),
+            )
+            if log_path:
+                st.caption(f"Log file: {log_path}")
+            else:
+                st.caption("Log file not found yet. Start the bot to generate logs.")
+
+            st.markdown(_render_colored_log_html(logs_text), unsafe_allow_html=True)
+
+            if st.button("📺 Open Live Log Popup", key="bot_runner_open_popup_btn"):
+                st.session_state["bot_open_live_popup"] = True
+
+            if _is_pid_running(st.session_state.get("bot_runner_pid")) and st.session_state.get("bot_open_live_popup"):
+                show_bot_logs_dialog(lines_to_show)
+
+    with tab7:
+        st.subheader("🧩 Missing Data")
+        st.caption("Check SKUs missing in Master SKU and SKUs with missing brand mapping.")
+
+        month_label = datetime.today().strftime("%B %Y")
+
+        st.markdown("### 1) Unknown Brand SKU")
+        unknown_brand_df = fetch_unknown_brand_sku_data(start_date, end_date, town_code)
+        if unknown_brand_df is None or unknown_brand_df.empty:
+            st.success("No Unknown/Unkown brand SKU found in selected date range.")
         else:
-            st.caption("Log file not found yet. Start the bot to generate logs.")
+            st.warning(f"Found {len(unknown_brand_df):,} SKU(s) missing in master or missing brand.")
+            st.dataframe(unknown_brand_df, use_container_width=True, hide_index=True, height=360)
+            unknown_brand_csv = unknown_brand_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="Export Unknown Brand SKU CSV",
+                data=unknown_brand_csv,
+                file_name=f"unknown_brand_sku_{town_code}_{start_date}_to_{end_date}.csv",
+                mime="text/csv",
+                key="missing_data_unknown_brand_export"
+            )
 
-        st.markdown(_render_colored_log_html(logs_text), unsafe_allow_html=True)
+        st.markdown("### 2) Current Month Target Missing")
+        target_status_df = fetch_current_month_target_status(town_code)
+        target_rows = 0
+        target_bookers = 0
+        target_brands = 0
+        if target_status_df is not None and not target_status_df.empty:
+            target_rows = int(pd.to_numeric(target_status_df.iloc[0].get("target_rows", 0), errors="coerce") or 0)
+            target_bookers = int(pd.to_numeric(target_status_df.iloc[0].get("target_bookers", 0), errors="coerce") or 0)
+            target_brands = int(pd.to_numeric(target_status_df.iloc[0].get("target_brands", 0), errors="coerce") or 0)
 
-        if st.button("📺 Open Live Log Popup", key="bot_runner_open_popup_btn"):
-            st.session_state["bot_open_live_popup"] = True
+        if target_rows <= 0:
+            st.error(f"Target Missing: {month_label} ka Value target upload nahi hua.")
+        else:
+            st.info(
+                f"{month_label} Value target uploaded rows: {target_rows:,} | "
+                f"Bookers: {target_bookers:,} | Brands: {target_brands:,}"
+            )
 
-        if _is_pid_running(st.session_state.get("bot_runner_pid")) and st.session_state.get("bot_open_live_popup"):
-            show_bot_logs_dialog(lines_to_show)
+        missing_target_df = fetch_current_month_missing_targets_from_sales(town_code)
+        if missing_target_df is None or missing_target_df.empty:
+            st.success("No missing Booker+Brand target found against current-month sales.")
+        else:
+            st.warning(
+                f"Found {len(missing_target_df):,} Booker+Brand combination(s) with sales but no current-month Value target."
+            )
+            st.dataframe(missing_target_df, use_container_width=True, hide_index=True, height=360)
+            missing_target_csv = missing_target_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="Export Missing Target CSV",
+                data=missing_target_csv,
+                file_name=f"missing_targets_{town_code}_{datetime.today().strftime('%Y_%m')}.csv",
+                mime="text/csv",
+                key="missing_data_target_export"
+            )
+
+        st.markdown("### 3) Missing Shop in Universe")
+        st.caption("Shops present in ordered_vsdelivered data but missing in universe master for selected period.")
+        missing_shop_df = fetch_missing_shops_from_universe(start_date, end_date, town_code)
+        if missing_shop_df is None or missing_shop_df.empty:
+            st.success("No missing shop found between ordered_vsdelivered data and universe.")
+        else:
+            if 'Sales_Value' in missing_shop_df.columns:
+                missing_shop_df['Sales_Value'] = pd.to_numeric(missing_shop_df['Sales_Value'], errors='coerce').fillna(0)
+            if 'Invoices' in missing_shop_df.columns:
+                missing_shop_df['Invoices'] = pd.to_numeric(missing_shop_df['Invoices'], errors='coerce').fillna(0).astype(int)
+            st.warning(
+                f"Found {len(missing_shop_df):,} shop(s) present in order data but missing in universe."
+            )
+            st.dataframe(missing_shop_df, use_container_width=True, hide_index=True, height=360)
+            missing_shop_csv = missing_shop_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="Export Missing Shop CSV",
+                data=missing_shop_csv,
+                file_name=f"missing_shops_universe_{town_code}_{start_date}_to_{end_date}.csv",
+                mime="text/csv",
+                key="missing_data_shop_export"
+            )
 
     st.markdown("---")
     st.markdown("© 2026 Bazaar Prime Analytics Dashboard | Powered by Streamlit")

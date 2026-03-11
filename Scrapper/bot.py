@@ -406,17 +406,14 @@ def get_salesflo_accounts() -> list[tuple[str, str, str]]:
     if second_user and second_pass:
         accounts.append(("account_2", second_user, second_pass))
 
-    # Remove duplicate credentials if both env entries point to same account.
-    deduped: list[tuple[str, str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for account_label, username, password in accounts:
-        key = (username, password)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append((account_label, username, password))
+    # Keep both configured accounts even if credentials match.
+    # Some deployments intentionally map same credentials to separate account labels.
+    if len(accounts) == 2 and accounts[0][1] == accounts[1][1] and accounts[0][2] == accounts[1][2]:
+        log.warning(
+            "SALESFLO account_1 and account_2 credentials are identical; processing both labels separately."
+        )
 
-    return deduped
+    return accounts
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2158,6 +2155,16 @@ async def generate_and_parse(page, start_date: date_type, end_date: date_type, p
             score += sum(1 for c in norm_cells if c in ORDERED_VS_DELIVERED_ALIASES)
             return score
 
+        def _is_ordered_header_candidate(cells: list[str]) -> bool:
+            if not cells:
+                return False
+            norm_cells = [_normalize_header_label(c) for c in cells]
+            alias_hits = sum(1 for c in norm_cells if c in ORDERED_VS_DELIVERED_ALIASES)
+            has_order = any("order" in c for c in norm_cells)
+            has_deliver = any("deliver" in c for c in norm_cells)
+            has_entity = any(("store" in c) or ("distributor" in c) or ("sku" in c) for c in norm_cells)
+            return alias_hits >= 4 or (alias_hits >= 2 and has_order and has_deliver and has_entity)
+
         for idx, row in enumerate(table_rows):
             norm = [str(col).strip().lower() for col in row]
             if parse_mode == "visits":
@@ -2165,7 +2172,7 @@ async def generate_and_parse(page, start_date: date_type, end_date: date_type, p
                     header_idx = idx
                     break
             elif parse_mode == "ordered_vs_delivered":
-                if _ordered_header_score([str(col) for col in row]) >= 3:
+                if _is_ordered_header_candidate([str(col) for col in row]):
                     header_idx = idx
                     break
             else:
@@ -2197,7 +2204,7 @@ async def generate_and_parse(page, start_date: date_type, end_date: date_type, p
                 else:
                     raise RuntimeError("Could not locate header row in generated report table.")
             elif parse_mode == "ordered_vs_delivered":
-                if external_header and _ordered_header_score([str(col) for col in external_header]) >= 3:
+                if external_header and _is_ordered_header_candidate([str(col) for col in external_header]):
                     header = [str(col).strip() for col in external_header]
                     data_rows = table_rows
                 elif table_rows:
@@ -2308,7 +2315,11 @@ async def generate_and_parse(page, start_date: date_type, end_date: date_type, p
                         }
                     )
         elif parse_mode == "visits":
-            for row in data_rows:
+            visit_data_rows = data_rows[:-1] if len(data_rows) > 1 else data_rows
+            if len(data_rows) > len(visit_data_rows):
+                log.info("Visits Summary parser: dropped last row (assumed total row).")
+
+            for row in visit_data_rows:
                 if not row or all((str(v).strip() == "") for v in row):
                     continue
                 first_cell = str(row[0]).strip().lower() if len(row) > 0 else ""
@@ -2391,6 +2402,13 @@ async def generate_and_parse(page, start_date: date_type, end_date: date_type, p
                     if canonical_key:
                         row_map[canonical_key] = source_val
 
+                # Fallback to positional mapping when header labels are unexpected but column order is stable.
+                for idx, canonical_col in enumerate(ORDERED_VS_DELIVERED_COLUMNS):
+                    if idx >= len(row):
+                        break
+                    if not row_map.get(canonical_col):
+                        row_map[canonical_col] = str(row[idx] or "").strip()
+
                 row_is_meaningful = any(
                     row_map.get(field, "").strip()
                     for field in ("Distributor Name", "Store Name", "SKU Code", "Order Number", "Invoice Number")
@@ -2409,6 +2427,15 @@ async def generate_and_parse(page, start_date: date_type, end_date: date_type, p
                         "raw_row": [str(v or "").strip() for v in row],
                         "row": row_map,
                     }
+                )
+
+            if not rows and (table_rows or data_rows):
+                header_sample = [str(c or "").strip() for c in normalized_header[:10]]
+                first_row_sample = [str(c or "").strip() for c in (data_rows[0] if data_rows else [])[:10]]
+                log.warning(
+                    "Ordered Vs Delivered parse produced 0 rows. "
+                    f"synthetic_header={synthetic_header_used} "
+                    f"header_sample={header_sample} first_row_sample={first_row_sample}"
                 )
 
         log.info(f"Generated report parsed -> {len(rows)} rows.")

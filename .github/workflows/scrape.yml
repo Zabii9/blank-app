@@ -2,7 +2,7 @@ name: Daily Sales Scraper
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # Runs daily at 3:00 UTC
+    - cron: "0 6 * * *"   # Runs daily at 11:00am UTC
   workflow_dispatch:       # Allows manual run
 
 jobs:
