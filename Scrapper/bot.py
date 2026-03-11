@@ -456,6 +456,13 @@ async def ensure_tables(conn):
                 run_date   DATE NOT NULL,
                 status     ENUM('success','failed','no_data') NOT NULL,
                 rows_saved INT DEFAULT 0,
+                rows_deleted INT DEFAULT 0,
+                account_label VARCHAR(50),
+                report_key VARCHAR(100),
+                table_name VARCHAR(100),
+                period_start DATE NULL,
+                period_end DATE NULL,
+                action_type VARCHAR(50) DEFAULT 'run',
                 message    TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -579,6 +586,29 @@ async def ensure_tables(conn):
             await cur.execute(
                 "ALTER TABLE end_stock_summary ADD UNIQUE KEY uq_date_acc_dist_sku (report_date, account_label, distributor_code, sku_code)"
             )
+
+        await cur.execute(
+            """
+            SELECT COLUMN_NAME
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=%s AND TABLE_NAME='bot_run_log'
+            """,
+            (DB_NAME,),
+        )
+        bot_log_existing_cols = {row[0].lower() for row in await cur.fetchall()}
+        bot_log_columns_to_add = {
+            "rows_deleted": "INT DEFAULT 0",
+            "account_label": "VARCHAR(50)",
+            "report_key": "VARCHAR(100)",
+            "table_name": "VARCHAR(100)",
+            "period_start": "DATE NULL",
+            "period_end": "DATE NULL",
+            "action_type": "VARCHAR(50) DEFAULT 'run'",
+        }
+        for col_name, col_def in bot_log_columns_to_add.items():
+            if col_name.lower() in bot_log_existing_cols:
+                continue
+            await cur.execute(f"ALTER TABLE bot_run_log ADD COLUMN {col_name} {col_def}")
 
         rename_columns = {
             "report_date": ("Report Date", "DATE NULL"),
@@ -915,11 +945,13 @@ async def save_visit_rows(conn, rows: list[dict]) -> int:
         }
         row_json = json.dumps(hash_payload, ensure_ascii=False, sort_keys=True)
         row_hash = hashlib.sha256(row_json.encode("utf-8")).hexdigest()
+        visit_date = _to_date(_pick(row_map, "Visit Date"))
+        delivery_date = _to_date(_pick(row_map, "Delivery Date"))
         deduped[row_hash] = {
-            "report_date": row.get("report_date"),
+            "report_date": visit_date or row.get("report_date"),
             "account_label": str(row.get("account_label") or ""),
-            "visit_date": _to_date(_pick(row_map, "Visit Date")),
-            "delivery_date": _to_date(_pick(row_map, "Delivery Date")),
+            "visit_date": visit_date,
+            "delivery_date": delivery_date,
             "distributor": _pick(row_map, "Distributor"),
             "pjp_name": _pick(row_map, "PJP Name"),
             "app_user": _pick(row_map, "App User"),
@@ -1116,8 +1148,10 @@ async def save_ordered_vs_delivered_rows(conn, rows: list[dict]) -> int:
         }
         row_json = json.dumps(hash_payload, ensure_ascii=False, sort_keys=True)
         row_hash = hashlib.sha256(row_json.encode("utf-8")).hexdigest()
+        order_date = _to_date(_pick(row_map, "Order Date"))
+        delivery_date = _to_date(_pick(row_map, "Delivery Date"))
         deduped[row_hash] = {
-            "report_date": row.get("report_date"),
+            "report_date": order_date or row.get("report_date"),
             "account_label": str(row.get("account_label") or ""),
             "s_no": _pick(row_map, "S.No#"),
             "distributor_name": _pick(row_map, "Distributor Name"),
@@ -1136,8 +1170,8 @@ async def save_ordered_vs_delivered_rows(conn, rows: list[dict]) -> int:
             "order_number": _pick(row_map, "Order Number"),
             "invoice_number": _pick(row_map, "Invoice Number"),
             "status": _pick(row_map, "Status"),
-            "order_date": _to_date(_pick(row_map, "Order Date")),
-            "delivery_date": _to_date(_pick(row_map, "Delivery Date")),
+            "order_date": order_date,
+            "delivery_date": delivery_date,
             "order_units": _to_float(_pick(row_map, "Order Units")),
             "order_grams": _to_float(_pick(row_map, "Order (Grams)")),
             "order_ml": _to_float(_pick(row_map, "Order (ML)")),
@@ -1263,12 +1297,75 @@ async def save_ordered_vs_delivered_rows(conn, rows: list[dict]) -> int:
     return len(payload)
 
 
-async def log_run(conn, run_date, status, rows_saved=0, message=""):
+async def log_run(
+    conn,
+    run_date,
+    status,
+    rows_saved=0,
+    message="",
+    *,
+    rows_deleted=0,
+    account_label="",
+    report_key="",
+    table_name="",
+    period_start=None,
+    period_end=None,
+    action_type="run",
+):
     async with conn.cursor() as cur:
         await cur.execute(
-            "INSERT INTO bot_run_log (run_date, status, rows_saved, message) VALUES (%s,%s,%s,%s)",
-            (run_date, status, rows_saved, message),
+            """
+            INSERT INTO bot_run_log (
+                run_date, status, rows_saved, rows_deleted, account_label,
+                report_key, table_name, period_start, period_end, action_type, message
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (
+                run_date,
+                status,
+                rows_saved,
+                rows_deleted,
+                account_label,
+                report_key,
+                table_name,
+                period_start,
+                period_end,
+                action_type,
+                message,
+            ),
         )
+
+
+async def delete_rows_for_period(
+    conn,
+    table_name: str,
+    start_date: date_type,
+    end_date: date_type,
+    account_label: str = "",
+) -> int:
+    """Delete selected-period rows for forced refresh before loading fresh data."""
+    account_label = str(account_label or "").strip()
+
+    if table_name == "visits_summary_rows":
+        date_col = "`Visit Date`"
+        account_col = "`Account Label`"
+    elif table_name == "ordered_vs_delivered_rows":
+        date_col = "`Order Date`"
+        account_col = "`Account Label`"
+    else:
+        date_col = "report_date"
+        account_col = "account_label"
+
+    sql = f"DELETE FROM {table_name} WHERE {date_col} BETWEEN %s AND %s"
+    params = [start_date, end_date]
+    if account_label:
+        sql += f" AND {account_col} = %s"
+        params.append(account_label)
+
+    async with conn.cursor() as cur:
+        await cur.execute(sql, tuple(params))
+        return int(cur.rowcount or 0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2743,7 +2840,19 @@ async def fetch_date_range(page, conn, report_key: str, report_cfg: dict, start_
 
         rows = await generate_and_parse(page, start_date, end_date, report_cfg.get("parse_mode", "visits"))
         if not rows:
-            await log_run(conn, end_date, "no_data", 0, f"{report_key}: Generated report returned 0 rows.")
+            await log_run(
+                conn,
+                end_date,
+                "no_data",
+                0,
+                f"{report_key}: Generated report returned 0 rows.",
+                account_label=account_label,
+                report_key=report_key,
+                table_name=report_cfg.get("table", ""),
+                period_start=start_date,
+                period_end=end_date,
+                action_type="run",
+            )
             return "no_data", 0
 
         if account_label:
@@ -2757,14 +2866,167 @@ async def fetch_date_range(page, conn, report_key: str, report_cfg: dict, start_
         else:
             saved = await save_visit_rows(conn, rows)
 
-        await log_run(conn, end_date, "success", saved, f"{report_key}")
+        await log_run(
+            conn,
+            end_date,
+            "success",
+            saved,
+            f"{report_key}",
+            account_label=account_label,
+            report_key=report_key,
+            table_name=report_cfg.get("table", ""),
+            period_start=start_date,
+            period_end=end_date,
+            action_type="run",
+        )
         log.info(f"SUCCESS [{report_key}] {start_date} -> {end_date} | {saved} rows saved.")
         return "success", saved
 
     except Exception as e:
         msg = str(e)
         log.error(f"ERROR [{report_key}] ({start_date}->{end_date}): {msg}")
-        await log_run(conn, end_date, "failed", 0, f"{report_key}: {msg}")
+        await log_run(
+            conn,
+            end_date,
+            "failed",
+            0,
+            f"{report_key}: {msg}",
+            account_label=account_label,
+            report_key=report_key,
+            table_name=report_cfg.get("table", ""),
+            period_start=start_date,
+            period_end=end_date,
+            action_type="run",
+        )
+        return "failed", 0
+
+
+async def forced_refresh_replace_date_range(
+    page,
+    conn,
+    report_key: str,
+    report_cfg: dict,
+    start_date: date_type,
+    end_date: date_type,
+    account_label: str = "",
+):
+    """Safer forced refresh: fetch first, then transactionally delete selected period and reload fresh data."""
+    deleted_rows = 0
+    saved = 0
+
+    try:
+        await navigate_to_report(page, report_cfg)
+        await set_filters(page, start_date, end_date, report_cfg)
+
+        rows = await generate_and_parse(page, start_date, end_date, report_cfg.get("parse_mode", "visits"))
+        if not rows:
+            await log_run(
+                conn,
+                end_date,
+                "no_data",
+                0,
+                f"{report_key}: Forced refresh generated report returned 0 rows.",
+                account_label=account_label,
+                report_key=report_key,
+                table_name=report_cfg.get("table", ""),
+                period_start=start_date,
+                period_end=end_date,
+                action_type="forced_refresh_replace",
+            )
+            return "no_data", 0
+
+        if account_label:
+            for row in rows:
+                row["account_label"] = account_label
+
+        try:
+            await conn.begin()
+            deleted_rows = await delete_rows_for_period(
+                conn,
+                report_cfg["table"],
+                start_date,
+                end_date,
+                account_label=account_label,
+            )
+
+            if report_cfg.get("save_mode") == "end_stock":
+                saved = await save_rows(conn, rows)
+            elif report_cfg.get("save_mode") == "ordered_vs_delivered":
+                saved = await save_ordered_vs_delivered_rows(conn, rows)
+            else:
+                saved = await save_visit_rows(conn, rows)
+
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
+
+        delete_message = (
+            f"forced_refresh_delete | account={account_label} | "
+            f"table={report_cfg['table']} | report={report_key} | "
+            f"period={start_date} -> {end_date} | rows_deleted={deleted_rows}"
+        )
+        await log_run(
+            conn,
+            end_date,
+            "success",
+            rows_saved=0,
+            rows_deleted=deleted_rows,
+            message=delete_message,
+            account_label=account_label,
+            report_key=report_key,
+            table_name=report_cfg["table"],
+            period_start=start_date,
+            period_end=end_date,
+            action_type="forced_refresh_delete",
+        )
+
+        replace_message = (
+            f"forced_refresh_replace | account={account_label} | "
+            f"table={report_cfg['table']} | report={report_key} | "
+            f"period={start_date} -> {end_date} | rows_deleted={deleted_rows} | rows_saved={saved}"
+        )
+        await log_run(
+            conn,
+            end_date,
+            "success",
+            rows_saved=saved,
+            rows_deleted=deleted_rows,
+            message=replace_message,
+            account_label=account_label,
+            report_key=report_key,
+            table_name=report_cfg["table"],
+            period_start=start_date,
+            period_end=end_date,
+            action_type="forced_refresh_replace",
+        )
+
+        log.info(
+            f"SUCCESS [forced_refresh][{account_label}][{report_key}] {start_date} -> {end_date} | "
+            f"rows_deleted={deleted_rows} | rows_saved={saved}"
+        )
+        return "success", saved
+
+    except Exception as exc:
+        msg = str(exc)
+        log.error(f"ERROR [forced_refresh][{report_key}] ({start_date}->{end_date}): {msg}")
+        await log_run(
+            conn,
+            end_date,
+            "failed",
+            rows_saved=0,
+            rows_deleted=0,
+            message=f"{report_key}: Forced refresh failed before commit or rolled back. {msg}",
+            account_label=account_label,
+            report_key=report_key,
+            table_name=report_cfg.get("table", ""),
+            period_start=start_date,
+            period_end=end_date,
+            action_type="forced_refresh_replace",
+        )
         return "failed", 0
 
 
@@ -2933,15 +3195,26 @@ async def run_bot():
                                 log.info(f"[{account_label}][{report_key}] Already up-to-date. Skipping.")
                                 continue
 
-                            rep_status, rep_saved = await fetch_date_range(
-                                page,
-                                conn,
-                                report_key,
-                                report_cfg,
-                                start_date,
-                                report_end_date,
-                                account_label=account_label,
-                            )
+                            if forced_start_date and forced_end_date:
+                                rep_status, rep_saved = await forced_refresh_replace_date_range(
+                                    page,
+                                    conn,
+                                    report_key,
+                                    report_cfg,
+                                    start_date,
+                                    report_end_date,
+                                    account_label=account_label,
+                                )
+                            else:
+                                rep_status, rep_saved = await fetch_date_range(
+                                    page,
+                                    conn,
+                                    report_key,
+                                    report_cfg,
+                                    start_date,
+                                    report_end_date,
+                                    account_label=account_label,
+                                )
                             aggregate_saved += rep_saved
                             if rep_status == "failed":
                                 aggregate_status = "failed"

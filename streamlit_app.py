@@ -3813,7 +3813,7 @@ def create_booker_period_heatmap(df, metric_type='Value'):
     label_data = label_data.reindex(index=heatmap_data.index, columns=heatmap_data.columns)
 
     x_labels = heatmap_data.columns.strftime('%b %Y')
-    label_text = label_data.applymap(lambda value: f"{value:.1f}{unit_label}" if pd.notna(value) else "")
+    label_text = label_data.map(lambda value: f"{value:.1f}{unit_label}" if pd.notna(value) else "")
 
     # Tableau-like discrete color bins for achievement %
     zmin, zmax = 0, 130
@@ -3935,7 +3935,7 @@ def create_channel_heatmap_YTD(df, metric_type='Value'):
     label_data = (heatmap_data / divisor).round(1)
 
     x_labels = heatmap_data.columns.strftime('%b %Y')
-    label_text = label_data.applymap(lambda value: f"{value:.1f}{unit_label}" if pd.notna(value) else "")
+    label_text = label_data.map(lambda value: f"{value:.1f}{unit_label}" if pd.notna(value) else "")
     
     discrete_colors = ['#d73027', '#fc8d59', '#fee08b', '#91cf60', '#1a9850']
     
